@@ -275,6 +275,7 @@ async def test_edit_retry_of_an_assigned_item_re_runs_on_the_worker(tmp_path):
     mgr = MagicMock()
     mgr.switch_session = AsyncMock()
     mgr.inject_message = AsyncMock()
+    mgr.persist_mention_message = AsyncMock(return_value="proj_sess1")
     mgr.get_sub_agent_manager = MagicMock(return_value=sub_mgr)
     mgr.get_loop = MagicMock(return_value=None)
     mgr.get_loop_task = MagicMock(return_value=None)

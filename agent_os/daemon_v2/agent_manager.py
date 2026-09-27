@@ -27,6 +27,7 @@ from agent_os.agent.session import Session, persist_user_row
 from agent_os.agent.tools.registry import ToolRegistry
 from agent_os.agent.project_paths import ProjectPaths
 from agent_os.agent.workspace_files import WorkspaceFileManager, run_session_end_routine
+from agent_os.agents.setup_engine import StaleOkView
 from agent_os.config.provider_registry import ProviderRegistry
 from agent_os.daemon_v2.default_skills_installer import install_default_skills
 from agent_os.daemon_v2.autonomy import AutonomyInterceptor
@@ -937,7 +938,10 @@ class AgentManager:
         sub_agent_slugs = resolve_visible_sub_agent_slugs(
             enabled_sub_agents=config.enabled_sub_agents,
             disabled_sub_agents=config.disabled_sub_agents,
-            setup_engine=self._setup_engine,
+            # Stale-ok: start_agent runs on the loop, and the config build it
+            # follows has just filled the cache (spec 101).
+            setup_engine=(StaleOkView(self._setup_engine)
+                          if self._setup_engine is not None else None),
             enabled_agents_legacy=config.enabled_agents,
         )
         enabled_agents_detail = []
@@ -1706,10 +1710,12 @@ class AgentManager:
 
         # Available sub-agents = installed minus the project's
         # disabled_sub_agents denylist. Legacy ``enabled_sub_agents`` is
-        # informational-only in v1.
+        # informational-only in v1. Stale-ok (spec 101): this runs at every
+        # turn start, and an expired result refreshes in the background
+        # instead of re-probing ~13 CLIs before the turn may begin.
         disabled = set(project.get("disabled_sub_agents", []) or [])
         if self._setup_engine is not None:
-            available = self._setup_engine.check_all()
+            available = self._setup_engine.check_all(allow_stale=True)
             enabled_sub_agents = [
                 a.slug for a in available
                 if a.installed and a.slug != "built-in"
@@ -1874,6 +1880,18 @@ class AgentManager:
             budget_action=project.get("budget_action", "pause"),
         )
 
+    async def _abuild_agent_config_from_project(self, project_id: str) -> AgentConfig:
+        """``_build_agent_config_from_project`` off the event loop (spec 101).
+
+        The build can block for seconds: a cold ``check_all()`` probes every
+        agent CLI by subprocess, and each card key is a Keychain read. On the
+        loop that froze every request of every project. The build only reads
+        (project row, settings file, Keychain, setup cache), so a worker
+        thread is safe. Callers re-check handle state after the await, since
+        another request may have started this session meanwhile.
+        """
+        return await asyncio.to_thread(self._build_agent_config_from_project, project_id)
+
     async def ensure_agent_started(self, project_id: str) -> bool:
         """Start the agent for ``project_id`` if it is not already running.
 
@@ -1892,7 +1910,9 @@ class AgentManager:
         """
         if self.has_handle(project_id):
             return False
-        config = self._build_agent_config_from_project(project_id)
+        config = await self._abuild_agent_config_from_project(project_id)
+        if self.has_handle(project_id):
+            return False
         await self.start_agent(project_id, config)
         return True
 
@@ -1930,7 +1950,13 @@ class AgentManager:
             # second half. Hydrate the on-disk session, append the event
             # FIRST (durable even if the wake fails), then start the loop so
             # an awaiting management session actually processes it.
-            loaded = self._load_session_from_disk(project_id, session_id)
+            loaded = await asyncio.to_thread(
+                self._load_session_from_disk, project_id, session_id)
+            if self._handles.get(make_session_key(project_id, session_id)) is not None:
+                # Hydrated by another request while the load ran off-loop:
+                # deliver through the live handle instead of a second copy.
+                return await self.inject_system_message(
+                    project_id, content, session_id=session_id, meta=meta)
             if loaded is None:
                 logger.warning(
                     "inject_system_message(%s/%s): no live handle and no "
@@ -1956,7 +1982,7 @@ class AgentManager:
                 # management LLM takes ZERO turns — no start_agent.
                 return "suppressed"
             try:
-                config = self._build_agent_config_from_project(project_id)
+                config = await self._abuild_agent_config_from_project(project_id)
                 await self.start_agent(
                     project_id, config, initial_message=None,
                     session_id=loaded.session_uuid, session=loaded,
@@ -2074,8 +2100,8 @@ class AgentManager:
             session.session_id = f1
         return session
 
-    def persist_mention_message(self, project_id: str, session_id: str | None,
-                                user_msg: dict) -> str:
+    async def persist_mention_message(self, project_id: str, session_id: str | None,
+                                      user_msg: dict) -> str:
         """Append an authored @mention user record to the project's canonical
         chat session and return that session's concrete id — WITHOUT waking the
         management loop.
@@ -2093,14 +2119,24 @@ class AgentManager:
         Returns the concrete session id the caller MUST thread to dispatch, the
         ack broadcast, and the lifecycle marker so persistence and dispatch
         converge on one session.
+
+        The disk hydrate runs in a worker thread (spec 101) — this is the
+        pinned direct-send path. The append, which takes the session file
+        lock, stays on the loop.
         """
         resolved = self._sid_inject(project_id, session_id)
-        handle = self._handles.get(make_session_key(project_id, resolved))
+        key = make_session_key(project_id, resolved)
+        handle = self._handles.get(key)
         if handle is not None:
             session = handle.session
         else:
-            session = self._load_session_from_disk(project_id, resolved)
-            if session is None:
+            session = await asyncio.to_thread(
+                self._load_session_from_disk, project_id, resolved)
+            handle = self._handles.get(key)
+            if handle is not None:
+                # Hydrated by another request while we were off the loop.
+                session = handle.session
+            elif session is None:
                 project = (self._project_store.get_project(project_id)
                            if self._project_store else None)
                 workspace = (project or {}).get("workspace", "") if project else ""
@@ -2302,7 +2338,9 @@ class AgentManager:
         self._clear_last_terminal_event(project_id, session_id)
         handle = self._handles.get(sk)
         if handle is None:
-            config = self._build_agent_config_from_project(project_id)
+            # Both the config build and the hydrate run off the event loop
+            # (spec 101); the session lock and handle registration stay here.
+            config = await self._abuild_agent_config_from_project(project_id)
             # Hydrate-on-inject: if a JSONL exists for this identifier (F1 or
             # F2/uuid), load it and CONTINUE the conversation rather than
             # forking a fresh empty session. This is the chat flow's only load
@@ -2317,7 +2355,15 @@ class AgentManager:
             # The meta F1 is still preserved on the loaded Session object
             # (loaded.session_id) for display/back-compat; it is simply no
             # longer the routing key. See REPORT-streaming-status-frontend.md.
-            loaded = self._load_session_from_disk(project_id, session_id)
+            loaded = await asyncio.to_thread(
+                self._load_session_from_disk, project_id, session_id)
+            if self._handles.get(sk) is not None:
+                # Another request started this session while we were off the
+                # loop: take the live-handle path (queue / hot resume) rather
+                # than racing it with a second hydrated copy.
+                return await self.inject_message(
+                    project_id, content, nonce=nonce, session_id=session_id,
+                    queue_state=queue_state)
             if loaded is not None:
                 logger.info(
                     "inject_message(%s): hydrating session uuid %s (meta F1 %s) from disk",
@@ -2465,7 +2511,11 @@ class AgentManager:
             # Re-derive config from the project store via the shared helper —
             # this path is reached when the original handle existed but the
             # session was stopped, so we need a fresh AgentConfig.
-            config = self._build_agent_config_from_project(project_id)
+            config = await self._abuild_agent_config_from_project(project_id)
+            if self._handles.get(sk) is not None:
+                return await self.inject_message(
+                    project_id, content, nonce=nonce, session_id=session_id,
+                    queue_state=queue_state)
             return await self._start_with_persisted_message(
                 project_id, config, content, nonce,
                 session_id=session_id, queue_state=queue_state,
@@ -5000,14 +5050,20 @@ class AgentManager:
         # mid-flight) keeps the existing providers and falls back to the
         # legacy key-only refresh.
         loop = handle.loop
+        task_before = handle.task
         fresh_cfg = None
         try:
-            fresh_cfg = self._build_agent_config_from_project(project_id)
+            fresh_cfg = await self._abuild_agent_config_from_project(project_id)
         except Exception:
             logger.warning(
                 "_start_loop(%s): live provider resolution failed; "
                 "keeping existing providers", project_id, exc_info=True,
             )
+        # The build ran off the loop (spec 101). If another resume started a
+        # run meanwhile, or the handle was replaced, that run owns the turn —
+        # it reads the same session, so whatever the caller appended is seen.
+        if self._handles.get(sk) is not handle or handle.task is not task_before:
+            return
         if fresh_cfg is not None and self._provider_config_changed(handle, fresh_cfg):
             provider, fallback_providers, utility_provider, _info = (
                 self._build_llm_providers(fresh_cfg)
