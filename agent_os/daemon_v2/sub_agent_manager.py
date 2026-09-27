@@ -131,6 +131,9 @@ class SubAgentManager:
         # the first.  This queue owns that execution invariant.
         self._prompt_queues: dict[tuple[str, str, str], deque[_QueuedPrompt]] = {}
         self._prompt_active: set[tuple[str, str, str]] = set()
+        # Strong refs for queued-prompt drains that must first rebuild a dead
+        # transport (spec 098); see _rebuild_and_drain.
+        self._rebuild_tasks: set[asyncio.Task] = set()
         # "Approve all" is Orbital's existing temporary (10 minute) bypass,
         # never a request for a provider-persistent allow grant.
         self._permission_bypass_until: dict[tuple[str, str, str], float] = {}
@@ -1089,6 +1092,19 @@ class SubAgentManager:
         if fresh and handle in self._adapters.get(sk, {}):
             await self.stop(project_id, handle, session_id=session_id)
 
+        # A handle whose transport died under it (spec 098: the SDK reader
+        # hit a fatal stdout error) is still in the slate, and dispatching
+        # into it is silence. Tear it down so spawn-on-demand below rebuilds
+        # it, resuming the persisted thread. A broken slot keeps its refusal.
+        existing = self._adapters.get(sk, {}).get(handle)
+        if existing is not None and getattr(existing, "_broken", False) is not True:
+            is_alive = getattr(existing, "is_alive", None)
+            if callable(is_alive) and is_alive() is False:
+                logger.info(
+                    "send: %s/%s transport is dead — rebuilding it with "
+                    "resume before dispatch", project_id, handle)
+                await self.stop(project_id, handle, session_id=session_id)
+
         # Spawn-on-demand pre-step, OUTSIDE the dispatch lock: start() takes
         # the same per-session lifecycle lock internally (non-reentrant), so
         # spawning under it would deadlock. A concurrent double-send race here
@@ -1318,6 +1334,18 @@ class SubAgentManager:
                     why="the sub-agent was no longer available before dispatch",
                 )
                 return
+            is_alive = getattr(adapter, "is_alive", None)
+            if callable(is_alive) and is_alive() is False:
+                # The turn that just closed killed the transport (spec 098).
+                # Rebuilding takes stop()/start(), which need this lock and
+                # cancel the consumer task we are running in, so hand off.
+                task = asyncio.create_task(
+                    self._rebuild_and_drain(project_id, handle, session_id),
+                    name=f"rebuild-{project_id}-{handle}",
+                )
+                self._rebuild_tasks.add(task)
+                task.add_done_callback(self._rebuild_tasks.discard)
+                return
             prompt = queue.popleft()
             if not queue:
                 self._prompt_queues.pop(key, None)
@@ -1347,6 +1375,42 @@ class SubAgentManager:
                     dropped, project_id, handle, session_id=session_id,
                     why="a prior dispatch failed",
                 )
+
+    async def _rebuild_and_drain(self, project_id: str, handle: str,
+                                 session_id: str) -> None:
+        """Re-send a dead handle's queued prompts, in order, through send().
+
+        send() stops the dead adapter and re-spawns it resuming the persisted
+        thread; the first prompt dispatches and the rest queue behind it as
+        they did before. If the rebuild fails, every prompt not yet handed
+        over gets a timeline row instead of vanishing.
+        """
+        key = (project_id, session_id, handle)
+        async with self._get_lock(project_id, session_id=session_id):
+            pending = self._prompt_queues.pop(key, None)
+        logger.info("queued prompts for %s/%s wait on a dead transport — "
+                    "rebuilding it with resume", project_id, handle)
+        while pending:
+            prompt = pending.popleft()
+            try:
+                result = await self.send(
+                    project_id, handle, prompt.message,
+                    session_id=session_id, dispatch_id=prompt.dispatch_id,
+                    initiator=prompt.initiator,
+                )
+            except Exception:
+                logger.exception("rebuild of %s/%s for a queued prompt failed",
+                                 project_id, handle)
+                result = "Error: rebuild raised"
+            if result.startswith("Error"):
+                logger.warning("rebuild of %s/%s for a queued prompt failed: %s",
+                               project_id, handle, result)
+                pending.appendleft(prompt)
+                await self._mark_queued_prompts_dropped(
+                    pending, project_id, handle, session_id=session_id,
+                    why="the sub-agent was no longer available before dispatch",
+                )
+                return
 
     async def respond_to_interaction(
         self, project_id: str, handle: str, interaction_id: str, *,
