@@ -52,6 +52,13 @@ try:
 except ImportError:
     _TaskStarted = _TaskNotification = ()
 
+try:
+    # Not re-exported by the package; same ``()`` sentinel so a move degrades
+    # to "every consumer error is checked against the reader".
+    from claude_agent_sdk._errors import MessageParseError as _MessageParseError
+except ImportError:
+    _MessageParseError = ()
+
 logger = logging.getLogger(__name__)
 
 
@@ -165,6 +172,11 @@ class SDKTransport(AgentTransport):
             can_use_tool=self._handle_permission,
             cli_path=command or None,
             env=sdk_env,
+            # The SDK's 1 MiB default refuses a single stdout line above it
+            # and kills its reader (spec 098): a Read of a ~660 KB PNG comes
+            # back as a 1.2 MB base64 tool-result line. The CLI already
+            # downscales images, so 16 MiB is headroom, not a licence.
+            max_buffer_size=16 * 1024 * 1024,
         )
         if self._system_prompt is not None:
             # Re-rendered per dispatch; idempotent on resume — the append is
@@ -372,6 +384,7 @@ class SDKTransport(AgentTransport):
         result_is_error = False
         cause: str | None = None
         outstanding: set = set()
+        dead_reader_error: Exception | None = None
 
         async def _consume_one_turn() -> None:
             nonlocal got_result, result_is_error
@@ -409,6 +422,11 @@ class SDKTransport(AgentTransport):
                     data={"error": str(e)},
                     raw_text=f"Error: {e}",
                 ))
+                # Settled BEFORE turn_complete: the handle's queued-prompt
+                # drain runs on that event and must already see is_alive()
+                # False, or it dispatches into the dead client.
+                if await self._reader_died(e):
+                    dead_reader_error = e
 
             if not got_result:
                 self._needs_flush = True
@@ -435,6 +453,60 @@ class SDKTransport(AgentTransport):
                     "model": self._last_model,
                 },
             ))
+        # After turn_complete, so the turn end reaches the user without
+        # waiting on the kill.
+        if dead_reader_error is not None:
+            await self._kill_after_reader_death(dead_reader_error)
+
+    # The SDK reader's own shutdown (send "error", then "end") can still be in
+    # flight when the consumer sees the error; allow it this long to finish.
+    READER_EXIT_GRACE_S: float = 2.0
+
+    def _sdk_read_task(self) -> "asyncio.Future | None":
+        """The SDK's background stdout reader, or None when unreachable."""
+        task = getattr(getattr(self._client, "_query", None), "_read_task", None)
+        return task if isinstance(task, asyncio.Future) else None
+
+    async def _reader_died(self, exc: Exception) -> bool:
+        """True when ``exc`` ended the SDK's reader.
+
+        Any exception inside the SDK's reader task (a line over
+        ``max_buffer_size``, the CLI exiting mid-turn) ends that task for
+        good: nothing reads the CLI's stdout again, so a reused client takes
+        the next query and never answers (reproduced on spec 098).
+        ``is_alive()`` reports the dead reader so the manager rebuilds the
+        client with resume. A ``MessageParseError`` is raised in the
+        consumer's parse step while the reader carries on, so it never
+        qualifies.
+        """
+        if isinstance(exc, _MessageParseError):
+            return False
+        task = self._sdk_read_task()
+        if task is None:
+            return False
+        if not task.done():
+            await asyncio.wait({task}, timeout=self.READER_EXIT_GRACE_S)
+        return task.done()
+
+    async def _kill_after_reader_death(self, exc: Exception) -> None:
+        """Kill the claude process behind a dead reader.
+
+        Makes the not-alive verdict true for ``list_active()``, which evicts
+        a not-alive adapter without ``stop()`` and would otherwise orphan a
+        CLI still holding the session.
+        """
+        proc = self._proc
+        logger.warning(
+            "SDKTransport: the SDK message reader died (%s); killing claude "
+            "pid=%s — the next dispatch rebuilds the client with resume",
+            exc, getattr(proc, "pid", None))
+        if proc is None:
+            return
+        try:
+            from agent_os.agent.transports.process_kill import kill_process_tree
+            await kill_process_tree(proc, label="sdk")
+        except Exception:
+            logger.exception("SDKTransport: kill after reader death raised")
 
     async def _flush_stale_messages(self) -> None:
         """Drain leftover messages from the SDK buffer after a prior crash.
@@ -559,7 +631,13 @@ class SDKTransport(AgentTransport):
                 logger.debug("SDKTransport: closing %s failed", name, exc_info=True)
 
     def is_alive(self) -> bool:
-        return self._alive
+        # A finished SDK reader means a dead client even though stop() never
+        # ran (see _reader_died). read_stream() keeps using _alive so
+        # the dying turn's error and turn_complete still drain.
+        if not self._alive:
+            return False
+        task = self._sdk_read_task()
+        return task is None or not task.done()
 
     def update_autonomy(self, preset: Autonomy) -> None:
         """Update the autonomy preset for permission filtering (live settings update)."""
