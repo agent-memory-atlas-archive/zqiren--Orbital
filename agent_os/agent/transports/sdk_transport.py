@@ -465,10 +465,17 @@ class SDKTransport(AgentTransport):
     # flight when the consumer sees the error; allow it this long to finish.
     READER_EXIT_GRACE_S: float = 2.0
 
-    def _sdk_read_task(self) -> "asyncio.Future | None":
-        """The SDK's background stdout reader, or None when unreachable."""
+    def _sdk_read_task(self):
+        """The SDK's background stdout reader, or None when unreachable.
+
+        claude-agent-sdk 0.1.x stores an ``asyncio.Task``; 0.2.x wraps it in
+        its own ``TaskHandle`` (``_internal/_task_compat``). Both expose
+        ``done()``, which is all the dead-reader check needs, so duck-type on
+        that instead of a class — an ``isinstance(asyncio.Future)`` check
+        silently disabled this whole path on 0.2.x.
+        """
         task = getattr(getattr(self._client, "_query", None), "_read_task", None)
-        return task if isinstance(task, asyncio.Future) else None
+        return task if callable(getattr(task, "done", None)) else None
 
     async def _reader_died(self, exc: Exception) -> bool:
         """True when ``exc`` ended the SDK's reader.
@@ -488,7 +495,12 @@ class SDKTransport(AgentTransport):
         if task is None:
             return False
         if not task.done():
-            await asyncio.wait({task}, timeout=self.READER_EXIT_GRACE_S)
+            # Poll rather than asyncio.wait(): a 0.2.x TaskHandle is not an
+            # awaitable Future, and its wait() re-raises the reader's error.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.READER_EXIT_GRACE_S
+            while not task.done() and loop.time() < deadline:
+                await asyncio.sleep(0.02)
         return task.done()
 
     async def _kill_after_reader_death(self, exc: Exception) -> None:
