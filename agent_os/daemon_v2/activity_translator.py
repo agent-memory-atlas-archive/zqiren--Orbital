@@ -7,8 +7,10 @@
 Translates session messages to agent.activity and chat.stream_delta WS events.
 """
 
+import asyncio
 import json
 import re
+import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -102,6 +104,92 @@ def _result_preview(content) -> dict:
     }
 
 
+# Spec 100: a worker's tool arguments ride the WS event and its transcript
+# row. The capsule reads only a path/command/query out of them, so long strings
+# (a Write's whole file, a diff) and long lists are cut.
+_ARG_STRING_BOUND = 1000
+_ARG_ITEMS_BOUND = 50
+_ARG_DEPTH_BOUND = 4
+# Worker thinking deltas are coalesced to at most one broadcast per interval
+# per worker: each frame is also a relay forward to mobile.
+_WORKER_THINKING_INTERVAL_S = 0.25
+
+
+def _cap_value(value, depth: int = 0):
+    if isinstance(value, str):
+        return value if len(value) <= _ARG_STRING_BOUND else value[:_ARG_STRING_BOUND] + "…"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if depth >= _ARG_DEPTH_BOUND:
+        return _cap_value(str(value), depth)
+    if isinstance(value, dict):
+        return {str(k): _cap_value(v, depth + 1)
+                for k, v in list(value.items())[:_ARG_ITEMS_BOUND]}
+    if isinstance(value, (list, tuple)):
+        return [_cap_value(v, depth + 1) for v in list(value)[:_ARG_ITEMS_BOUND]]
+    return _cap_value(str(value), depth)
+
+
+def worker_display_meta(chunk_type: str, metadata: dict | None) -> dict:
+    """Spec 100: the display slice of a worker chunk's transport metadata.
+
+    One vocabulary over every transport's tool event shape, written to the
+    worker transcript row and broadcast live, so the live capsule and the
+    reloaded one read the same fields:
+
+    - ``tool_activity`` / ``tool_result``: ``tool_call_id`` (SDK/codex/pi
+      ``tool_id``, ACP ``tool_call_id``), ``tool_name``, capped ``arguments``,
+      ``status``; plus, when the event carries a result (``tool_result``'s
+      ``content``, or a completion's ``result``), the capsule's preview of it
+      (``_result_preview``) and ``is_error``.
+    - ``thinking``: ``delta`` when the text is a stream fragment.
+
+    Display-only: never read by the manager's LLM context.
+    """
+    meta = metadata or {}
+    out: dict = {}
+    if chunk_type in ("tool_activity", "tool_result"):
+        tool_call_id = meta.get("tool_call_id") or meta.get("tool_id")
+        if tool_call_id:
+            out["tool_call_id"] = str(tool_call_id)
+        if meta.get("tool_name"):
+            out["tool_name"] = str(meta["tool_name"])
+        args = meta.get("tool_input")
+        if args is not None:
+            if not isinstance(args, dict):
+                args = {"input": args}
+            if args:
+                out["arguments"] = _cap_value(args)
+        status = meta.get("status")
+        if isinstance(status, str) and status:
+            out["status"] = status
+        if chunk_type == "tool_result" or "result" in meta:
+            result = meta.get("content") if chunk_type == "tool_result" else meta.get("result")
+            if result is not None and not isinstance(result, str):
+                result = str(result)
+            out.update(_result_preview(result or ""))
+            out["is_error"] = bool(meta.get("is_error")) or status in ("failed", "error")
+        return out
+    if chunk_type == "thinking":
+        return {"delta": True} if meta.get("delta") else {}
+    return out
+
+
+class _WorkerLive:
+    """Per-(project, session, handle) live state for a worker's turn."""
+
+    def __init__(self, project_id: str, session_id: str | None, handle: str):
+        self.project_id = project_id
+        self.session_id = session_id
+        self.handle = handle
+        # tool_call_id -> (tool_name, arguments) last broadcast for the row.
+        self.calls: dict[str, tuple] = {}
+        self.thinking = ""
+        self.last_flush = 0.0
+        self.timer: "asyncio.TimerHandle | None" = None
+        self.last_kind = ""
+
+
 def _describe_tool(tool_name: str, args: dict) -> str:
     """Build human-readable description from tool name and arguments."""
     if tool_name == "read":
@@ -143,6 +231,8 @@ class ActivityTranslator:
         self._ws = ws_manager
         self._last_status: dict[str, str] = {}  # project_id -> last status summary
         self._stream_seq: dict[str, int] = {}  # project_id -> monotonic seq counter
+        # Spec 100: live state of each running worker turn.
+        self._workers: dict[tuple, _WorkerLive] = {}
 
     def _extract_status(self, content: str) -> str | None:
         """Extract [STATUS: ...] from agent output."""
@@ -301,6 +391,127 @@ class ActivityTranslator:
         # Reset counter after final delta so next response starts at 1
         if is_final:
             self._stream_seq[project_id] = 0
+
+    # ── Spec 100: a worker's tool calls and thinking, live ────────────────
+
+    def on_worker_chunk(self, chunk_type: str, display: dict, text: str,
+                        project_id: str, *, session_id: str | None,
+                        handle: str) -> None:
+        """Broadcast one worker ``tool_activity`` / ``tool_result`` /
+        ``thinking`` chunk (``display`` = ``worker_display_meta``).
+
+        Tool events are ``agent.activity`` frames with ``category:
+        "agent_output"`` plus ``worker_event`` ("tool_call" | "tool_result"):
+        a frontend that predates spec 100 drops ``agent_output`` on arrival,
+        so an old build ignores them instead of rendering a worker's calls
+        into the manager's capsule. Thinking rides ``chat.stream_delta``
+        (reasoning only, ``worker: true``), coalesced per worker. Never
+        ``chat.sub_agent_message``: the status bar refetches on each of those.
+        """
+        key = (project_id, session_id or "", handle)
+        state = self._workers.get(key)
+        if state is None:
+            state = self._workers[key] = _WorkerLive(project_id, session_id, handle)
+        if chunk_type == "thinking":
+            if text:
+                # Whole blocks back to back are separate paragraphs (the
+                # transcript reader joins them the same way).
+                if not display.get("delta") and state.last_kind == "thinking":
+                    text = "\n\n" + text
+                state.thinking += text
+                state.last_kind = "thinking"
+                self._schedule_worker_thinking(key, state)
+            return
+        # Keep the order the worker produced: pending thinking goes first.
+        self._flush_worker_thinking(key)
+        state.last_kind = chunk_type
+        tool_call_id = display.get("tool_call_id") or ""
+        known = state.calls.get(tool_call_id) if tool_call_id else None
+        name = display.get("tool_name") or (known[0] if known else "")
+        args = display.get("arguments") or (known[1] if known else None)
+        # A new row, or an in-place update to a known one (an ACP progress or
+        # a codex completion adding a title or arguments). A bare result for
+        # a call never seen opens its row only when it names the tool.
+        opens_row = chunk_type == "tool_activity" or bool(name) or known is not None
+        if opens_row and (known is None or (name, args) != known):
+            if tool_call_id:
+                state.calls[tool_call_id] = (name, args)
+            self._broadcast_worker_tool(
+                state, "tool_call", name or "tool", args, tool_call_id)
+        if "result_preview" in display:
+            self._broadcast_worker_tool(
+                state, "tool_result", name or "tool", None, tool_call_id,
+                extra={k: display[k] for k in (
+                    "result_preview", "result_total_chars",
+                    "result_total_lines", "is_error") if k in display})
+
+    def on_worker_turn_closed(self, project_id: str, *,
+                              session_id: str | None, handle: str) -> None:
+        """Flush a worker's pending thinking and drop its turn state."""
+        key = (project_id, session_id or "", handle)
+        self._flush_worker_thinking(key)
+        self._workers.pop(key, None)
+
+    def _broadcast_worker_tool(self, state: _WorkerLive, worker_event: str,
+                               name: str, args, tool_call_id: str,
+                               extra: dict | None = None) -> None:
+        event = {
+            "type": "agent.activity",
+            "project_id": state.project_id,
+            "session_id": state.session_id,
+            "id": uuid4().hex,
+            "category": "agent_output",
+            "worker_event": worker_event,
+            "description": (f"Using {name}" if worker_event == "tool_call"
+                            else "Tool result received"),
+            "tool_name": name,
+            "tool_call_id": tool_call_id,
+            "source": state.handle,
+            "timestamp": _now(),
+        }
+        if args is not None:
+            event["arguments"] = args
+        if extra:
+            event.update(extra)
+        self._ws.broadcast(state.project_id, event)
+
+    def _schedule_worker_thinking(self, key: tuple, state: _WorkerLive) -> None:
+        elapsed = time.monotonic() - state.last_flush
+        if elapsed >= _WORKER_THINKING_INTERVAL_S:
+            self._flush_worker_thinking(key)
+            return
+        if state.timer is not None:
+            return  # a flush is already due; this text rides it
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._flush_worker_thinking(key)  # no loop to defer on
+            return
+        state.timer = loop.call_later(
+            _WORKER_THINKING_INTERVAL_S - elapsed,
+            self._flush_worker_thinking, key)
+
+    def _flush_worker_thinking(self, key: tuple) -> None:
+        state = self._workers.get(key)
+        if state is None:
+            return
+        if state.timer is not None:
+            state.timer.cancel()
+            state.timer = None
+        if not state.thinking:
+            return
+        text, state.thinking = state.thinking, ""
+        state.last_flush = time.monotonic()
+        self._ws.broadcast(state.project_id, {
+            "type": "chat.stream_delta",
+            "project_id": state.project_id,
+            "session_id": state.session_id,
+            "text": "",
+            "reasoning_content": text,
+            "source": state.handle,
+            "is_final": False,
+            "worker": True,
+        })
 
     def on_network_blocked(self, project_id: str, domain: str, method: str,
                            *, session_id: str | None = None) -> None:

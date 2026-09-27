@@ -233,6 +233,22 @@ vi.mock('../lib/attachment-upload', async (importOriginal) => {
   return { ...actual, uploadFile: (...args: unknown[]) => uploadFileMock(...args) };
 });
 
+// Spec 100 §3.4.8 render-count spy: the real ChatMessage, counting renders
+// per message content, so a test can prove an unchanged row did not
+// re-render when a live update touched another one.
+const chatMessageRenders = new Map<string, number>();
+vi.mock('./ChatMessage', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./ChatMessage')>();
+  const { createElement } = await import('react');
+  const Real = actual.default;
+  function CountingChatMessage(props: Parameters<typeof Real>[0]) {
+    const key = props.message.content ?? '';
+    chatMessageRenders.set(key, (chatMessageRenders.get(key) ?? 0) + 1);
+    return createElement(Real, props);
+  }
+  return { ...actual, default: CountingChatMessage };
+});
+
 import ChatView, {
   appendLiveReasoning,
   __clearChatHistoryCacheForTests,
@@ -3810,5 +3826,220 @@ describe('ChatView: live tool rows show their result', () => {
     expect(text).toContain('Message to @codex');
     expect(text).toContain('PERSISTED-BRIEF');
     expect(text).toContain('Dispatched to codex. Awaiting completion.');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 100: a pinned worker's tool calls and thinking, live in the chat
+// ---------------------------------------------------------------------------
+
+function workerTool(extra: Record<string, unknown>) {
+  return {
+    type: 'agent.activity',
+    project_id: 'p1',
+    session_id: 's1',
+    id: `ev-${Math.random().toString(36).slice(2)}`,
+    category: 'agent_output',
+    worker_event: 'tool_call',
+    description: 'Using Read',
+    tool_name: 'Read',
+    source: 'claude-code',
+    timestamp: new Date().toISOString(),
+    ...extra,
+  };
+}
+
+function capsules() {
+  return Array.from(container.querySelectorAll('[data-testid="agent_run"]'));
+}
+
+describe('Spec 100: live worker capsule', () => {
+  it('renders a worker tool call with its arguments and pairs its result by id', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+
+    await act(async () => {
+      emitWs('agent.activity', workerTool({
+        tool_call_id: 'tu1', arguments: { file_path: 'C:/tmp/p1/notes.txt' },
+      }));
+    });
+
+    expect(capsules()).toHaveLength(1);
+    expect(capsules()[0].getAttribute('data-capsule-status')).toBe('running');
+    const row = container.querySelector('[data-testid="tool-call-row"]')!;
+    expect(row.textContent).toContain('Read');
+    expect(row.textContent).toContain('notes.txt');
+
+    await act(async () => {
+      emitWs('agent.activity', workerTool({
+        worker_event: 'tool_result', tool_call_id: 'tu1', result_preview: 'hello from disk',
+        description: 'Tool result received',
+      }));
+    });
+    await act(async () => {
+      (row.querySelector('button') as HTMLButtonElement).click();
+    });
+    expect(container.textContent).toContain('hello from disk');
+  });
+
+  it('updates a row in place when the same call arrives again (codex completion, ACP progress)', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+
+    await act(async () => {
+      emitWs('agent.activity', workerTool({ tool_name: 'Terminal', tool_call_id: 'k1', source: 'cursor' }));
+      emitWs('agent.activity', workerTool({
+        tool_name: 'Terminal', tool_call_id: 'k1', source: 'cursor', arguments: { command: 'ls -la' },
+      }));
+    });
+
+    const rows = container.querySelectorAll('[data-testid="tool-call-row"]');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toContain('ls -la');
+  });
+
+  it('renders worker thinking from a worker stream delta, batched per frame', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+
+    await act(async () => {
+      for (const part of ['Plan: ', 'read the ', 'notes.']) {
+        emitWs('chat.stream_delta', {
+          type: 'chat.stream_delta', project_id: 'p1', session_id: 's1', text: '',
+          reasoning_content: part, source: 'codex', is_final: false, worker: true,
+        });
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    });
+
+    expect(capsules()).toHaveLength(1);
+    expect(container.textContent).toContain('Plan: read the notes.');
+  });
+
+  it('keeps worker rows out of a running manager capsule', async () => {
+    await renderChat({ agentStatus: 'running', sessionId: 's1' });
+    await flushEffects();
+
+    await act(async () => {
+      emitWs('agent.activity', {
+        type: 'agent.activity', project_id: 'p1', session_id: 's1', id: 'm1',
+        category: 'file_read', tool_name: 'read', arguments: { path: 'mgr.txt' },
+        description: 'Reading mgr.txt', source: 'management', timestamp: new Date().toISOString(),
+      });
+      emitWs('agent.activity', workerTool({ tool_call_id: 'w1', arguments: { file_path: 'worker.txt' } }));
+    });
+
+    const runs = capsules();
+    expect(runs).toHaveLength(2);
+    expect(runs[0].textContent).toContain('mgr.txt');
+    expect(runs[0].textContent).not.toContain('worker.txt');
+    expect(runs[1].textContent).toContain('worker.txt');
+  });
+
+  it('closes the worker capsule when the worker speaks', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+
+    await act(async () => {
+      emitWs('agent.activity', workerTool({ tool_call_id: 'tu1', arguments: { file_path: 'a' } }));
+      emitWs('chat.sub_agent_message', {
+        type: 'chat.sub_agent_message', project_id: 'p1', session_id: 's1',
+        content: 'Found it.', source: 'claude-code', timestamp: new Date().toISOString(),
+      });
+    });
+
+    expect(capsules()[0].getAttribute('data-capsule-status')).toBe('completed');
+    expect(container.textContent).toContain('Found it.');
+  });
+
+  it('drops worker events for fanout workers and legacy agent_output echoes', async () => {
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+
+    await act(async () => {
+      emitWs('agent.activity', workerTool({ source: 'worker:f1-0', tool_call_id: 'x' }));
+      emitWs('agent.activity', {
+        type: 'agent.activity', project_id: 'p1', session_id: 's1', id: 'legacy',
+        category: 'agent_output', description: 'some text', tool_name: '',
+        source: 'claude-code', timestamp: new Date().toISOString(),
+      });
+      emitWs('chat.stream_delta', {
+        type: 'chat.stream_delta', project_id: 'p1', session_id: 's1', text: '',
+        reasoning_content: 'fanout thought', source: 'worker:f1-0', is_final: false, worker: true,
+      });
+      await new Promise((r) => setTimeout(r, 40));
+    });
+
+    expect(capsules()).toHaveLength(0);
+    expect(container.textContent).not.toContain('fanout thought');
+  });
+
+  it('a reload mid-run shows the in-flight capsule, and live events extend it', async () => {
+    chatInitialResponse = {
+      data: [
+        {
+          role: 'assistant', content: '', source: 'sub_agent', timestamp: '2026-09-27T00:00:00Z',
+          sub_agent_handle: 'codex', sub_agent_in_flight: true, sub_agent_duration: 0,
+          sub_agent_tool_rows: [{
+            name: 'commandExecution', timestamp: '2026-09-27T00:00:00Z', duration_seconds: 0,
+            tool_call_id: 'c1', arguments: { command: 'ls' },
+          }],
+        },
+      ],
+      total: 1,
+    };
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+
+    expect(capsules()).toHaveLength(1);
+    expect(capsules()[0].getAttribute('data-capsule-status')).toBe('running');
+
+    await act(async () => {
+      emitWs('agent.activity', workerTool({
+        source: 'codex', tool_name: 'commandExecution', worker_event: 'tool_result',
+        tool_call_id: 'c1', result_preview: 'a.txt',
+      }));
+      emitWs('agent.activity', workerTool({
+        source: 'codex', tool_name: 'commandExecution', tool_call_id: 'c2',
+        arguments: { command: 'cat a.txt' },
+      }));
+    });
+
+    expect(capsules()).toHaveLength(1);
+    const rows = container.querySelectorAll('[data-testid="tool-call-row"]');
+    expect(rows).toHaveLength(2);
+    expect(rows[1].textContent).toContain('cat a.txt');
+  });
+});
+
+describe('Spec 100: a live update re-renders only the row it changed', () => {
+  it('appending a worker row or a bubble does not re-render the earlier messages', async () => {
+    chatMessageRenders.clear();
+    const history = ['alpha-unique', 'beta-unique', 'gamma-unique'].map((content, i) => ({
+      role: 'assistant', content, source: 'management', timestamp: `2026-09-27T00:00:0${i}Z`,
+    }));
+    chatInitialResponse = { data: history, total: history.length };
+    await renderChat({ sessionId: 's1' });
+    await flushEffects();
+    expect(container.textContent).toContain('gamma-unique');
+    const before = new Map(chatMessageRenders);
+
+    await act(async () => {
+      emitWs('agent.activity', workerTool({ tool_call_id: 'tu1', arguments: { file_path: 'a' } }));
+    });
+    await act(async () => {
+      emitWs('agent.activity', workerTool({ tool_call_id: 'tu2', arguments: { file_path: 'b' } }));
+    });
+    await act(async () => {
+      emitWs('chat.sub_agent_message', {
+        type: 'chat.sub_agent_message', project_id: 'p1', session_id: 's1',
+        content: 'delta-unique', source: 'claude-code', timestamp: new Date().toISOString(),
+      });
+    });
+
+    for (const content of ['alpha-unique', 'beta-unique', 'gamma-unique']) {
+      expect(chatMessageRenders.get(content)).toBe(before.get(content));
+    }
+    expect(chatMessageRenders.get('delta-unique')).toBeGreaterThan(0);
   });
 });

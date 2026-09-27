@@ -361,11 +361,31 @@ export interface ChatMessage {
    * distinct `sub_agent_run` block. See agents_v2._interleave_sub_agent_summaries.
    */
   sub_agent_handle?: string;
-  /** Per-tool rows synthesized from the sub-agent transcript: one entry per
-   *  `[Using tool: X]` chunk, in chronological order. Name + duration only —
-   *  the SDK transport streams no args/results. */
-  sub_agent_tool_rows?: Array<{ name: string; timestamp: string; duration_seconds: number }>;
+  /** Per-tool rows synthesized from the sub-agent transcript, in
+   *  chronological order. Transcripts written before spec 100 give name +
+   *  duration only; newer ones add the call's id, arguments and result. */
+  sub_agent_tool_rows?: SubAgentToolRow[];
   sub_agent_duration?: number;
+  /** Spec 100: the turn's non-empty thinking, each block placed after
+   *  `after_tool` tool rows. Absent when the turn had none. */
+  sub_agent_thinking?: Array<{ content: string; after_tool: number }>;
+  /** Spec 100: the dispatch is still running; the rows are the run so far. */
+  sub_agent_in_flight?: boolean;
+}
+
+/** One tool row of a sub-agent turn (agents_v2._interleave_sub_agent_summaries). */
+export interface SubAgentToolRow {
+  name: string;
+  timestamp: string;
+  duration_seconds: number;
+  tool_call_id?: string;
+  arguments?: Record<string, unknown>;
+  /** The part of the result the capsule shows (500 chars / 12 lines). */
+  result_preview?: string;
+  /** Present when result_preview was cut: the full result's size. */
+  result_total_chars?: number;
+  result_total_lines?: number;
+  is_error?: boolean;
 }
 
 // `queued` (spec 081) is a session that exists only as a queued first message:
@@ -462,6 +482,9 @@ export interface StreamDeltaEvent {
   source: string;
   is_final: boolean;
   seq?: number;
+  /** Spec 100: a sub-agent's thinking (reasoning only, `source` = its
+   * handle). Never part of the manager's streamed turn. */
+  worker?: boolean;
 }
 
 export type ActivityCategory =
@@ -503,6 +526,11 @@ export interface ActivityEvent {
    * result's size (chars in UTF-16 units) for the truncation footer. */
   result_total_chars?: number;
   result_total_lines?: number;
+  /** Spec 100: set on a sub-agent's live tool call / result (`source` = its
+   * handle). These ride `category: 'agent_output'`, which older frontends
+   * drop on arrival. */
+  worker_event?: 'tool_call' | 'tool_result';
+  is_error?: boolean;
   source: string;
   timestamp: string;
 }

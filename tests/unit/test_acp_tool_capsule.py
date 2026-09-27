@@ -25,6 +25,7 @@ import pytest
 
 from agent_os.agent.transports.acp_sdk_transport import ACPSDKTransport
 from agent_os.agent.transports.base import transport_event_to_chunk
+from agent_os.daemon_v2.activity_translator import worker_display_meta
 from agent_os.daemon_v2.sub_agent_transcript import (
     SubAgentTranscript,
     _summarize_turn,
@@ -34,9 +35,9 @@ from agent_os.daemon_v2.sub_agent_transcript import (
 acp_schema = pytest.importorskip("acp.schema")
 
 
-def _tool_call_start(title="bash", **kwargs):
+def _tool_call_start(title="bash", tool_call_id="call-1", **kwargs):
     return acp_schema.ToolCallStart(
-        sessionUpdate="tool_call", toolCallId="call-1", title=title, **kwargs
+        sessionUpdate="tool_call", toolCallId=tool_call_id, title=title, **kwargs
     )
 
 
@@ -47,13 +48,17 @@ def _tool_call_progress(status="completed", **kwargs):
 
 
 def _entry(chunk, timestamp):
-    """The exact dict ProcessManager appends (process_manager.py:371-375)."""
-    return {
+    """The dict ProcessManager appends, spec 100 display metadata included."""
+    entry = {
         "source": "dsh",
         "content": chunk.text,
         "timestamp": timestamp,
         "chunk_type": chunk.chunk_type,
     }
+    display = worker_display_meta(chunk.chunk_type, chunk.metadata)
+    if display:
+        entry["metadata"] = display
+    return entry
 
 
 class TestTransportEmitsTheCapsuleFormat:
@@ -72,21 +77,25 @@ class TestTransportEmitsTheCapsuleFormat:
         assert event.data["tool_name"] == "bash"
         assert event.data["tool_call_id"] == "call-1"
 
-    def test_progress_updates_also_carry_the_format(self):
+    def test_progress_updates_carry_no_capsule_text(self):
+        """Spec 100: a progress update belongs to its start's row. With the
+        format text it would count as a second call for the legacy regex."""
         event = ACPSDKTransport()._session_update_to_event(
             _tool_call_progress(status="completed", title="bash")
         )
 
-        assert event.raw_text == "[Using tool: bash]"
+        assert event.event_type == "tool_result"
+        assert event.raw_text == ""
+        assert event.data["tool_call_id"] == "call-1"
 
     def test_falls_back_to_kind_then_to_a_generic_name(self):
-        """A title-less update must still parse — never an unnamed row."""
+        """A title-less start must still parse — never an unnamed row."""
         by_kind = ACPSDKTransport()._session_update_to_event(
-            _tool_call_progress(kind="execute")
+            _tool_call_start("", kind="execute")
         )
         assert by_kind.raw_text == "[Using tool: execute]"
 
-        untitled = ACPSDKTransport()._session_update_to_event(_tool_call_progress())
+        untitled = ACPSDKTransport()._session_update_to_event(_tool_call_start(""))
         assert untitled.raw_text == "[Using tool: tool]"
 
 
@@ -125,9 +134,10 @@ class TestCapsuleRows:
     def test_several_tools_keep_their_names_and_first_seen_order(self):
         chunks = [
             transport_event_to_chunk(
-                ACPSDKTransport()._session_update_to_event(_tool_call_start(name))
+                ACPSDKTransport()._session_update_to_event(
+                    _tool_call_start(name, tool_call_id=f"call-{index}"))
             )
-            for name in ("bash", "read_file", "bash")
+            for index, name in enumerate(("bash", "read_file", "bash"))
         ]
         entries = [
             _entry(chunk, f"2026-08-14T00:00:0{index}+00:00")
@@ -203,18 +213,10 @@ class TestShimPayloadCompatibility:
         assert event.data["status"] == "in_progress"
 
     def test_one_dispatched_tool_call_yields_exactly_one_capsule_row(self):
-        """Why the shim is start-only, pinned as a test.
-
-        The capsule appends a row per ``tool_activity`` chunk and never
-        de-duplicates by ``toolCallId`` — ``chatTransform.ts`` even synthesizes
-        each row's id from its INDEX. So emitting a terminal
-        ``tool_call_update`` alongside the start would render every single call
-        twice (``bash · 3.2s`` then ``bash · 0.0s``). One frame per invocation
-        is also exactly what claude-code does (``sdk_transport.py:636``), which
-        is the parity bar. If a terminal frame is ever restored, the capsule
-        must learn to de-duplicate in the same change — and this test is where
-        that shows up.
-        """
+        """Spec 100: the capsule pairs by toolCallId, so a terminal
+        ``tool_call_update`` completes the start's row instead of adding one.
+        (Before spec 100 the pair rendered twice, which is why the shim still
+        emits only the start frame; that stays safe.)"""
         start = transport_event_to_chunk(
             ACPSDKTransport()._session_update_to_event(
                 acp_schema.ToolCallStart.model_validate(
@@ -224,31 +226,39 @@ class TestShimPayloadCompatibility:
         )
         terminal = transport_event_to_chunk(
             ACPSDKTransport()._session_update_to_event(
-                _tool_call_progress(status="completed", title="bash")
+                acp_schema.ToolCallProgress(
+                    sessionUpdate="tool_call_update", toolCallId="spike-call-1",
+                    status="completed", title="bash",
+                )
             )
         )
 
         shipped = _summarize_turn([_entry(start, "2026-08-14T00:00:00+00:00")])
         assert len(shipped["tool_rows"]) == 1
 
-        doubled = _summarize_turn([
+        paired = _summarize_turn([
             _entry(start, "2026-08-14T00:00:00+00:00"),
             _entry(terminal, "2026-08-14T00:00:03+00:00"),
         ])
-        assert len(doubled["tool_rows"]) == 2, (
-            "the capsule does not de-duplicate by toolCallId, which is the "
-            "whole reason the shim emits only the start frame"
+        assert len(paired["tool_rows"]) == 1
+        assert paired["tool_rows"][0]["duration_seconds"] == 3.0
+        assert paired["tool_rows"][0]["is_error"] is False
+
+    def test_a_failed_terminal_status_marks_the_row(self):
+        """The terminal status now lands on the start's row."""
+        start = transport_event_to_chunk(
+            ACPSDKTransport()._session_update_to_event(_tool_call_start("bash"))
+        )
+        terminal = transport_event_to_chunk(
+            ACPSDKTransport()._session_update_to_event(
+                _tool_call_progress(status="failed", title="bash")
+            )
         )
 
-    def test_the_capsule_has_no_status_affordance_to_lose(self):
-        """The dropped terminal status costs the user nothing today."""
-        terminal = ACPSDKTransport()._session_update_to_event(
-            _tool_call_progress(status="failed", title="bash")
-        )
-        chunk = transport_event_to_chunk(terminal)
+        summary = _summarize_turn([
+            _entry(start, "2026-08-14T00:00:00+00:00"),
+            _entry(terminal, "2026-08-14T00:00:01+00:00"),
+        ])
 
-        summary = _summarize_turn([_entry(chunk, "2026-08-14T00:00:00+00:00")])
-
-        assert set(summary["tool_rows"][0]) == {
-            "name", "timestamp", "duration_seconds",
-        }, "a capsule row carries no status field for a terminal frame to fill"
+        assert len(summary["tool_rows"]) == 1
+        assert summary["tool_rows"][0]["is_error"] is True

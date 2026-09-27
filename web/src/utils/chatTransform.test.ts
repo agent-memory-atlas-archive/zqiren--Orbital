@@ -8,6 +8,7 @@ import {
   truncateResult,
   mergeRecoveredAssistantMessage,
   describeLiveActivity,
+  describeWorkerTool,
   dispatchFromToolCall,
 } from './chatTransform';
 import { translate } from '../i18n/useT';
@@ -1997,5 +1998,148 @@ describe('transformChatHistory — compaction marker', () => {
     ]);
     const first = items[0] as { isHistorical?: boolean };
     expect(first.isHistorical).toBe(true);
+  });
+});
+
+// Spec 100: a sub-agent capsule carries each call's arguments and result
+// (when the transcript has them) and the turn's thinking, and a dispatch
+// still in flight renders as a running capsule the live events extend.
+describe('transformChatHistory — spec 100 enriched sub-agent capsule', () => {
+  type Run = Extract<ReturnType<typeof transformChatHistory>[number], { type: 'agent_run' }>;
+  function capsuleOf(messages: ChatMessage[]): Run {
+    const run = transformChatHistory(messages, '/w').find((i) => i.type === 'agent_run');
+    expect(run).toBeDefined();
+    return run as Run;
+  }
+  function sub(overrides: Partial<ChatMessage>): ChatMessage {
+    return {
+      role: 'assistant',
+      content: 'Done.',
+      source: 'sub_agent',
+      timestamp: TS,
+      sub_agent_handle: 'claude-code',
+      sub_agent_duration: 4,
+      ...overrides,
+    };
+  }
+
+  it('rows with arguments render the live detail and an expandable result', () => {
+    const run = capsuleOf([
+      sub({
+        sub_agent_tool_rows: [
+          {
+            name: 'Read', timestamp: TS, duration_seconds: 0.4, tool_call_id: 'tu1',
+            arguments: { file_path: '/w/notes.txt' }, result_preview: 'hello', is_error: false,
+          },
+          {
+            name: 'commandExecution', timestamp: TS2, duration_seconds: 2, tool_call_id: 'c1',
+            arguments: { command: 'ls -la', cwd: '/w' },
+            result_preview: 'a', result_total_chars: 900, result_total_lines: 40,
+          },
+        ],
+      }),
+    ]);
+
+    expect(run.source).toBe('claude-code');
+    const rows = run.items.filter((c) => c.type === 'tool_call_row');
+    expect(rows).toHaveLength(2);
+    const [read, cmd] = rows as Array<Extract<(typeof rows)[number], { type: 'tool_call_row' }>>;
+    expect(read.tool_call_id).toBe('tu1');
+    expect(read.target_description).toBe(
+      describeWorkerTool('Read', { file_path: '/w/notes.txt' }, '/w'),
+    );
+    expect(read.target_description).toContain('notes.txt');
+    expect(read.result_content).toBe('hello');
+    expect(read.result_status).toBe('received');
+    expect(cmd.target_description).toContain('ls -la');
+    expect(cmd.category).toBe('command_exec');
+    expect(cmd.result_totals).toEqual({ chars: 900, lines: 40 });
+  });
+
+  it('legacy rows keep the duration-only detail', () => {
+    const run = capsuleOf([
+      sub({ sub_agent_tool_rows: [{ name: 'Write', timestamp: TS, duration_seconds: 1.2 }] }),
+    ]);
+    const row = run.items[0];
+    expect(row.type === 'tool_call_row' && row.target_description).toBe('1.2s');
+    expect(row.type === 'tool_call_row' && row.result_content).toBeNull();
+  });
+
+  it('thinking sits between the rows it came between', () => {
+    const run = capsuleOf([
+      sub({
+        sub_agent_tool_rows: [
+          { name: 'Glob', timestamp: TS, duration_seconds: 0, tool_call_id: 'g', arguments: { pattern: '*.md' } },
+        ],
+        sub_agent_thinking: [
+          { content: 'Find the notes first.', after_tool: 0 },
+          { content: 'Found them.', after_tool: 1 },
+          { content: '   ', after_tool: 1 },
+        ],
+      }),
+    ]);
+    expect(run.items.map((c) => c.type)).toEqual(['reasoning_block', 'tool_call_row', 'reasoning_block']);
+    expect(run.has_thinking).toBe(true);
+  });
+
+  it('a thinking-only turn still gets its capsule', () => {
+    const run = capsuleOf([
+      sub({ sub_agent_tool_rows: [], sub_agent_thinking: [{ content: 'Just answer.', after_tool: 0 }] }),
+    ]);
+    expect(run.items.map((c) => c.type)).toEqual(['reasoning_block']);
+  });
+
+  it('an in-flight dispatch is a running capsule with pending rows and no answer yet', () => {
+    const items = transformChatHistory(
+      [
+        sub({
+          content: '',
+          sub_agent_in_flight: true,
+          sub_agent_tool_rows: [
+            { name: 'Read', timestamp: TS, duration_seconds: 0, tool_call_id: 'a', arguments: { file_path: 'x' }, result_preview: 'ok' },
+            { name: 'Bash', timestamp: TS2, duration_seconds: 0, tool_call_id: 'b', arguments: { command: 'sleep 5' } },
+          ],
+        }),
+      ],
+      '/w',
+    );
+    const run = items.find((i) => i.type === 'agent_run') as Run;
+    expect(run.status).toBe('running');
+    expect(run.ended_at).toBeNull();
+    const statuses = run.items.map((c) => (c.type === 'tool_call_row' ? c.result_status : ''));
+    expect(statuses).toEqual(['received', 'pending']);
+    // No response bubble: the in-flight turn has not answered.
+    expect(items.filter((i) => i.type === 'agent_message' && !i.isHeaderOnly)).toHaveLength(0);
+    // The capsule is anchored under the worker's own header.
+    expect(items[0]).toMatchObject({ type: 'agent_message', source: 'claude-code', isHeaderOnly: true });
+  });
+});
+
+describe('describeWorkerTool', () => {
+  const en: ActivityTranslate = (k, v) => translate('en', k, v);
+
+  it('renders known worker tools like the manager\'s', () => {
+    expect(describeWorkerTool('Bash', { command: 'npm test' }, '/w', en)).toBe(
+      describeLiveActivity('shell', { command: 'npm test' }, '/w', en, ''),
+    );
+    expect(describeWorkerTool('Read', { file_path: '/w/a.ts' }, '/w', en)).toContain('a.ts');
+    expect(describeWorkerTool('Grep', { pattern: 'TODO' }, '/w', en)).toContain('TODO');
+  });
+
+  it('lists a codex fileChange\'s paths', () => {
+    expect(
+      describeWorkerTool('fileChange', { changes: [{ path: 'a.py' }, { path: 'b.py' }] }, '/w', en),
+    ).toContain('a.py, b.py');
+  });
+
+  it('falls back to the main argument, then to "Used X"', () => {
+    expect(describeWorkerTool('fs.list', { path: '/w/src' }, '/w', en)).toBe('/w/src');
+    expect(describeWorkerTool('webSearch', { query: 'orbital agents' }, '/w', en)).toBe(
+      translate('en', 'activity.searched', { query: 'orbital agents' }),
+    );
+    expect(describeWorkerTool('imageView', { path: '/tmp/x.png' }, '/w', en)).toBe('/tmp/x.png');
+    expect(describeWorkerTool('Terminal', undefined, '/w', en)).toBe(
+      translate('en', 'activity.usedTool', { name: 'Terminal' }),
+    );
   });
 });

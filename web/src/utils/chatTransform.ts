@@ -86,6 +86,13 @@ export type DisplayItem =
       ended_at: number | null;
       isHistorical?: boolean;
       /**
+       * Spec 100: the sub-agent handle whose run this capsule shows. Unset
+       * for the management agent's own capsules. Live events join a running
+       * capsule only when this matches their source, so a worker's rows and
+       * the manager's never land in each other's capsule.
+       */
+      source?: string;
+      /**
        * When true, the renderer starts this capsule expanded so the reasoning
        * is visible without the user having to click the chevron. Set by the
        * transform when a content-null turn with reasoning opens the capsule.
@@ -421,6 +428,68 @@ export function describeLiveActivity(
     function: { name: toolName, arguments: JSON.stringify(args) },
   };
   return toolCallToActivity(tc, '', undefined, workspace, tr).description;
+}
+
+// Spec 100: a sub-agent's own tool names (claude-code, codex, ACP agents)
+// mapped onto the Orbital tool whose description renders the same arguments.
+const WORKER_TOOL_ALIASES: Record<string, string> = {
+  bash: 'shell',
+  commandexecution: 'shell',
+  execute: 'shell',
+  read: 'read',
+  read_file: 'read',
+  write: 'write',
+  edit: 'edit',
+  multiedit: 'edit',
+  glob: 'glob',
+  grep: 'grep',
+  websearch: 'web_search',
+  web_search: 'web_search',
+  webfetch: 'web_fetch',
+  web_fetch: 'web_fetch',
+};
+
+// For any other tool: the first of these arguments that holds text.
+const WORKER_SUMMARY_ARGS = ['command', 'file_path', 'path', 'query', 'pattern', 'url', 'prompt', 'description', 'input'];
+
+/** Spec 100: the row detail for a sub-agent's tool call, from its arguments.
+ * Known tools render like the manager's own; codex's fileChange lists its
+ * paths; any other tool shows its main argument, or "Used X" when it has
+ * none. Shared by the live capsule and the reloaded one, so both agree. */
+export function describeWorkerTool(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+  workspace: string | undefined,
+  tr: ActivityTranslate = EN_ACTIVITY,
+): string {
+  const key = toolName.toLowerCase();
+  if (key === 'filechange' && Array.isArray(args?.changes)) {
+    const paths = (args.changes as unknown[])
+      .map((c) => (c && typeof c === 'object' ? (c as { path?: unknown }).path : undefined))
+      .filter((p): p is string => typeof p === 'string' && p !== '');
+    if (paths.length > 0) return tr('activity.edited', { path: paths.join(', ') });
+  }
+  const canonical = WORKER_TOOL_ALIASES[key];
+  if (canonical && args) {
+    return describeLiveActivity(canonical, args, workspace, tr, '');
+  }
+  if (args) {
+    for (const k of WORKER_SUMMARY_ARGS) {
+      const v = args[k];
+      if (typeof v === 'string' && v.trim()) {
+        const line = v.trim().split('\n')[0];
+        return line.length > 120 ? `${line.slice(0, 120)}…` : line;
+      }
+    }
+  }
+  return tr('activity.usedTool', { name: toolName });
+}
+
+/** Spec 100: a sub-agent tool row's category (drives nothing but the row's
+ * data), by the same alias map. */
+export function workerToolCategory(toolName: string): ActivityCategory {
+  const key = toolName.toLowerCase();
+  return TOOL_NAME_TO_CATEGORY[WORKER_TOOL_ALIASES[key] ?? key] ?? 'tool_use';
 }
 
 /** The agent and full message of an `agent_message` send/respond, read from
@@ -781,13 +850,18 @@ export function transformChatHistory(
     // it renders with the SAME display items as the management agent: an
     // agent header, a collapsible `agent_run` tool capsule, and a response
     // bubble. The handle rides on `source` (drives both the name and the icon
-    // in ChatMessage). Tool rows carry name + duration only — no args/results
-    // are on the wire.
+    // in ChatMessage). Spec 100: rows carry the call's arguments and result
+    // when the transcript has them (older transcripts: name + duration only),
+    // the turn's thinking sits between them, and a dispatch still in flight
+    // renders its capsule so far as running — the same capsule the live
+    // events are extending.
     if (msg.source === 'sub_agent') {
       finalizeCapsule();
       const handle = msg.sub_agent_handle ?? 'sub-agent';
       const startedAtMs = tsToMs(msg.timestamp);
       const toolRows = msg.sub_agent_tool_rows ?? [];
+      const thinking = (msg.sub_agent_thinking ?? []).filter((b) => b.content.trim());
+      const inFlight = !!msg.sub_agent_in_flight;
 
       // 1 & 2. Header + tool capsule, emitted together: the header only
       // exists to anchor the capsule that follows, so no capsule means no
@@ -795,7 +869,7 @@ export function transformChatHistory(
       // bubble's own identical header right after it was rendering as two
       // adjacent headers for the same turn). The response bubble (step 3)
       // always carries its own header regardless.
-      if (toolRows.length > 0) {
+      if (toolRows.length > 0 || thinking.length > 0) {
         items.push({
           type: 'agent_message',
           content: '',
@@ -806,35 +880,67 @@ export function transformChatHistory(
 
         const counts: Record<string, number> = {};
         const capsuleItems: CapsuleChild[] = [];
+        const pushThinking = (afterTool: number) => {
+          for (const block of thinking) {
+            if (block.after_tool !== afterTool) continue;
+            capsuleItems.push({
+              type: 'reasoning_block',
+              content: block.content,
+              timestamp: msg.timestamp,
+              turn_id: `sub:${handle}:${msg.timestamp}:${afterTool}`,
+            });
+          }
+        };
         for (let r = 0; r < toolRows.length; r++) {
+          pushThinking(r);
           const row = toolRows[r];
           const name = row.name || 'tool';
           counts[name] = (counts[name] ?? 0) + 1;
-          const category = TOOL_NAME_TO_CATEGORY[name.toLowerCase()] ?? 'tool_use';
+          const hasResult = row.result_preview !== undefined;
           capsuleItems.push({
             type: 'tool_call_row',
             tool_name: name,
-            // No args/results available; surface the per-tool duration as the
-            // row detail (honest: "Write · 1.2s").
-            target_description: `${(row.duration_seconds ?? 0).toFixed(1)}s`,
-            tool_call_id: `sub:${handle}:${msg.timestamp}:${r}`,
-            category,
+            // With arguments: the same detail the live row showed. Without
+            // (older transcripts): the per-tool duration ("Write · 1.2s").
+            target_description: row.arguments
+              ? describeWorkerTool(name, row.arguments, workspace, tr)
+              : `${(row.duration_seconds ?? 0).toFixed(1)}s`,
+            tool_call_id: row.tool_call_id || `sub:${handle}:${msg.timestamp}:${r}`,
+            category: workerToolCategory(name),
             timestamp: row.timestamp || msg.timestamp,
-            result_content: null,
-            result_status: 'received',
+            result_content: hasResult ? (row.result_preview ?? '') : null,
+            // A call of a finished turn with no result recorded still
+            // expands ("no result"); in flight it is still pending.
+            result_status: hasResult || !inFlight ? 'received' : 'pending',
+            ...(row.result_total_chars !== undefined && row.result_total_lines !== undefined
+              ? { result_totals: { chars: row.result_total_chars, lines: row.result_total_lines } }
+              : {}),
           });
+        }
+        pushThinking(toolRows.length);
+        // A block placed past the last row (a mismatched count) still shows.
+        for (const block of thinking) {
+          if (block.after_tool > toolRows.length) {
+            capsuleItems.push({
+              type: 'reasoning_block',
+              content: block.content,
+              timestamp: msg.timestamp,
+              turn_id: `sub:${handle}:${msg.timestamp}:${block.after_tool}`,
+            });
+          }
         }
         const durationMs = Math.round((msg.sub_agent_duration ?? 0) * 1000);
         items.push({
           type: 'agent_run',
           capsule_id: `sub_agent:${handle}:${msg.timestamp}:${capsuleCounter++}`,
-          status: 'completed',
+          status: inFlight ? 'running' : 'completed',
           items: capsuleItems,
           tool_call_count_by_name: counts,
-          has_thinking: false,
+          has_thinking: thinking.length > 0,
           started_at: startedAtMs,
-          ended_at: startedAtMs + durationMs,
+          ended_at: inFlight ? null : startedAtMs + durationMs,
           defaultExpanded: false,
+          source: handle,
         });
       }
 

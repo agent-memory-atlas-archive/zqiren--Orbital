@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import type { ReactNode } from 'react';
-import { isValidElement, useMemo } from 'react';
+import { isValidElement, memo, useMemo } from 'react';
 import ReactMarkdown, { type Components, type Options } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { FileText, PanelRightOpen } from 'lucide-react';
@@ -153,7 +153,10 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   );
 }
 
-export default function MarkdownContent({
+// Memoized (spec 100 §3.4.8): the chat re-renders its whole transcript on
+// every live update, and re-parsing each message's markdown is the cost. The
+// props are a string plus stable references, so an unchanged message skips.
+export default memo(function MarkdownContent({
   content,
   workspace,
   onOpenPath,
@@ -223,4 +226,4 @@ export default function MarkdownContent({
       </ReactMarkdown>
     </div>
   );
-}
+});

@@ -7,7 +7,9 @@
 import json
 import os
 import re
+import sys
 from datetime import datetime, timezone
+from functools import lru_cache
 
 
 def _now() -> str:
@@ -29,11 +31,48 @@ def _parse_ts(value) -> "datetime | None":
         return None
 
 
+# Spec 100: result fields a transcript row's ``metadata`` carries when its
+# tool call finished (activity_translator.worker_display_meta).
+_RESULT_KEYS = ("result_preview", "result_total_chars", "result_total_lines", "is_error")
+
+# The one ACP status row with fixed, non-thought text (acp_sdk_transport's
+# plan update). Legacy transcripts persisted no metadata, so a thought row is
+# told apart from it by content alone.
+_LEGACY_STATUS_TEXTS = frozenset({"Plan updated"})
+
+
+@lru_cache(maxsize=1)
+def _acp_handles() -> frozenset:
+    """Slugs of the bundled agents on the ACP transport (``acp-sdk``).
+
+    Only an ACP agent's legacy ``status`` rows were thought chunks; pty/pipe
+    output parsers write "Thinking..." / "Loading..." placeholders as status
+    rows too, and those must never render as thinking. Read once from the
+    same bundled manifest directory the daemon's registry loads (app.py).
+    Empty on any failure: no backfill beats a wrong one.
+    """
+    try:
+        from agent_os.agents.registry import AgentRegistry
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            manifests_dir = os.path.join(sys._MEIPASS, "agent_os", "agents", "manifests")
+        else:
+            manifests_dir = os.path.join(
+                os.path.dirname(__file__), "..", "agents", "manifests")
+        registry = AgentRegistry()
+        registry.load_directory(manifests_dir)
+        return frozenset(
+            m.slug for m in registry.list_all()
+            if str(getattr(m.runtime, "transport", "")).startswith("acp"))
+    except Exception:
+        return frozenset()
+
+
 def _summarize_turn(entries: list) -> dict:
     """Summarize ONE turn's (boundary-free) chunks into the capsule-shaped dict::
 
         {
             "tool_rows": [{"name": "Write", "timestamp": "...", "duration_seconds": 1.2}, ...],
+            "thinking": [{"content": "...", "after_tool": 0}, ...],
             "total_duration_seconds": 7.3,             # first→last chunk in the turn
             "response": "The file already exists ...",  # last response/message in the turn
             "chunk_count": 4,
@@ -43,15 +82,44 @@ def _summarize_turn(entries: list) -> dict:
 
     ``response`` is the LAST response/message chunk in THIS turn, or ``""`` if
     the turn produced none (errored / interrupted / tool-only). Callers MUST NOT
-    alias a neighboring turn's text into an empty one. Tool-row durations look
-    ahead only within the turn (the last tool's gap to the following chunk, or
-    0). Only the tool *name* is available (the SDK streams ``[Using tool: X]``).
+    alias a neighboring turn's text into an empty one.
+
+    Tool rows (spec 100) are built from a row's ``metadata`` when it has one:
+    the row also carries ``tool_call_id``, ``arguments`` and, once its result
+    arrived (a ``tool_result`` row or a completion with the same id, updating
+    the row in place — never a second row), ``result_preview`` [+ totals] and
+    ``is_error``; its duration runs to the result. A row with no metadata
+    (transcripts written before spec 100) falls back to the ``[Using tool: X]``
+    name regex and a look-ahead duration (the gap to the following chunk).
+    That fallback is also why codex/pi rows, whose text is ``[Running …]``,
+    only appear once metadata exists.
+
+    ``thinking`` lists the turn's non-empty thinking in order, each block with
+    ``after_tool`` = the number of tool rows before it. Consecutive thinking
+    rows merge into one block (stream fragments concatenate, whole blocks join
+    as paragraphs). Legacy ACP thoughts (``status`` rows with no metadata,
+    from an agent on the ACP transport only) are backfilled the same way.
     """
     chunk_count = len(entries)
     response = ""
     tool_rows: list = []
     tools_used: list = []
     seen_tools: set = set()
+    rows_by_id: dict = {}
+    row_started: dict = {}
+    thinking: list = []
+    last_was_thinking = False
+
+    def _note_tool(name: str) -> None:
+        if name not in seen_tools:
+            seen_tools.add(name)
+            tools_used.append(name)
+
+    def _add_thinking(text: str, *, delta: bool, merge: bool) -> None:
+        if merge and thinking and thinking[-1]["after_tool"] == len(tool_rows):
+            thinking[-1]["content"] += text if delta else "\n\n" + text
+        elif text.strip():
+            thinking.append({"content": text, "after_tool": len(tool_rows)})
 
     first_ts = None
     last_ts = None
@@ -65,6 +133,44 @@ def _summarize_turn(entries: list) -> dict:
     for idx, e in enumerate(entries):
         chunk_type = e.get("chunk_type")
         content = e.get("content") or ""
+        meta = e.get("metadata") if isinstance(e.get("metadata"), dict) else None
+        ts = _parse_ts(e.get("timestamp"))
+        was_thinking, last_was_thinking = last_was_thinking, False
+
+        if chunk_type in ("tool_activity", "tool_result") and meta:
+            tool_call_id = meta.get("tool_call_id") or ""
+            row = rows_by_id.get(tool_call_id) if tool_call_id else None
+            if row is None:
+                if chunk_type == "tool_result" and not meta.get("tool_name"):
+                    continue  # a result for a call this turn never showed
+                name = str(meta.get("tool_name") or "tool")
+                row = {
+                    "name": name,
+                    "timestamp": e.get("timestamp") or "",
+                    "duration_seconds": 0.0,
+                }
+                if tool_call_id:
+                    row["tool_call_id"] = tool_call_id
+                    rows_by_id[tool_call_id] = row
+                row_started[id(row)] = ts
+                tool_rows.append(row)
+                _note_tool(name)
+            elif meta.get("tool_name") and row["name"] == "tool":
+                row["name"] = str(meta["tool_name"])
+                _note_tool(row["name"])
+            if meta.get("arguments"):
+                # The latest arguments win: codex completes a webSearch with
+                # the query its start lacked, ACP progress adds raw input.
+                row["arguments"] = meta["arguments"]
+            if "result_preview" in meta:
+                for key in _RESULT_KEYS:
+                    if key in meta:
+                        row[key] = meta[key]
+                started = row_started.get(id(row))
+                if started is not None and ts is not None:
+                    row["duration_seconds"] = round(
+                        max(0.0, (ts - started).total_seconds()), 1)
+            continue
 
         if chunk_type == "tool_activity":
             m = _TOOL_ACTIVITY_RE.search(content)
@@ -73,7 +179,6 @@ def _summarize_turn(entries: list) -> dict:
             name = m.group(1).strip()
             if not name:
                 continue
-            ts = _parse_ts(e.get("timestamp"))
             next_ts = _parse_ts(entries[idx + 1].get("timestamp")) if idx + 1 < len(entries) else None
             dur = 0.0
             if ts is not None and next_ts is not None:
@@ -83,12 +188,28 @@ def _summarize_turn(entries: list) -> dict:
                 "timestamp": e.get("timestamp") or "",
                 "duration_seconds": round(dur, 1),
             })
-            if name not in seen_tools:
-                seen_tools.add(name)
-                tools_used.append(name)
+            _note_tool(name)
+        elif chunk_type == "thinking" and content:
+            _add_thinking(content, delta=bool(meta and meta.get("delta")),
+                          merge=was_thinking)
+            last_was_thinking = True
+        elif (chunk_type == "status" and meta is None and content.strip()
+                and content not in _LEGACY_STATUS_TEXTS
+                and e.get("source") in _acp_handles()):
+            # D4 backfill: an old ACP thought chunk (streamed fragments).
+            _add_thinking(content, delta=True, merge=was_thinking)
+            last_was_thinking = True
         elif chunk_type in ("response", "message") or chunk_type is None:
             if content:
                 response = content
+
+    # Metadata rows whose result never arrived: look-ahead duration, as legacy.
+    for row in tool_rows:
+        if "tool_call_id" in row and "result_preview" not in row:
+            started = row_started.get(id(row))
+            if started is not None and last_ts is not None:
+                row["duration_seconds"] = round(
+                    max(0.0, (last_ts - started).total_seconds()), 1)
 
     total_duration_seconds = 0.0
     if first_ts is not None and last_ts is not None:
@@ -96,6 +217,7 @@ def _summarize_turn(entries: list) -> dict:
 
     return {
         "tool_rows": tool_rows,
+        "thinking": thinking,
         "total_duration_seconds": total_duration_seconds,
         "response": response,
         "chunk_count": chunk_count,
@@ -105,7 +227,8 @@ def _summarize_turn(entries: list) -> dict:
     }
 
 
-def read_sub_agent_summary(transcript_path: str) -> "list | None":
+def read_sub_agent_summary(transcript_path: str, *,
+                           include_in_flight: bool = False) -> "list | None":
     """Read a sub-agent JSONL transcript → a LIST of per-turn summary dicts.
 
     The transcript is split into turns on ``chunk_type="turn_complete"``
@@ -129,6 +252,12 @@ def read_sub_agent_summary(transcript_path: str) -> "list | None":
       whole file). Retroactivity guard for pre-boundary transcripts.
     - Boundary rows are split out before summarizing, so they never count toward
       a turn's ``chunk_count`` or duration.
+
+    ``include_in_flight`` (spec 100): the trailing chunks after the last
+    boundary are also returned, as a final turn with ``"in_flight": True``,
+    when they carry the ``dispatch_id`` of the turn in flight (ProcessManager
+    stamps it on every row; only rows with the latest stamp count). Unstamped trailing chunks (written before spec
+    100) are still dropped: nothing could join them to a marker.
 
     Returns ``None`` when the file does not exist, is empty, or contains no
     parseable JSON lines. Malformed individual lines are skipped, not fatal.
@@ -171,7 +300,14 @@ def read_sub_agent_summary(transcript_path: str) -> "list | None":
             current = []
         else:
             current.append(e)
-    if not boundary_seen:
+    in_flight_id = None
+    if include_in_flight and current:
+        # The LAST stamp: rows of a turn that died without a boundary may
+        # precede the live turn's rows.
+        in_flight_id = next(
+            (e.get("dispatch_id") for e in reversed(current) if e.get("dispatch_id")),
+            None)
+    if not boundary_seen and in_flight_id is None:
         # Legacy flat transcript (no boundary) → the whole file is one turn,
         # with no boundary to source a dispatch_id from.
         turns = [current]
@@ -181,6 +317,12 @@ def read_sub_agent_summary(transcript_path: str) -> "list | None":
     for turn_entries, dispatch_id in zip(turns, boundary_ids):
         summary = _summarize_turn(turn_entries)
         summary["dispatch_id"] = dispatch_id
+        result.append(summary)
+    if in_flight_id is not None:
+        summary = _summarize_turn(
+            [e for e in current if e.get("dispatch_id") == in_flight_id])
+        summary["dispatch_id"] = in_flight_id
+        summary["in_flight"] = True
         result.append(summary)
     return result
 
