@@ -50,16 +50,21 @@ SCHEMA: dict[str, dict[str, _ParamSchema]] = {
     "claude-code": {
         "model": _ParamSchema(
             name="model",
-            # Aliases (fable/haiku/sonnet/opus) auto-track the claude-code
-            # CLI's current default mapping and never go stale — keep them.
-            # The explicit pins must be refreshed each model generation; these
-            # are the current flagship IDs (was: claude-sonnet-4-6 /
-            # claude-opus-4-7 / claude-haiku-4-5-20251001).
+            # FALLBACK only: the settings route replaces this with the CLI's
+            # live account list (claude_models, initialize → models[]) and
+            # validates saves against it, so a new generation needs no code
+            # change. This list is what users see when that probe fails.
+            # Aliases (fable/haiku/sonnet/opus) track the CLI's own mapping;
+            # the pins are the current generation (was: claude-fable-5 /
+            # claude-opus-4-8 / claude-sonnet-5 / claude-haiku-4-5).
             allowed=(
                 "fable",
                 "haiku",
                 "sonnet",
                 "opus",
+                "claude-opus-5-5",
+                "claude-fable-5-1",
+                "claude-opus-5",
                 "claude-fable-5",
                 "claude-opus-4-8",
                 "claude-sonnet-5",
@@ -276,15 +281,18 @@ class SubAgentConfigStore:
         with self._lock:
             return {k: dict(v) for k, v in self._data.items()}
 
-    def set(self, slug: str, params: dict[str, str]) -> dict[str, str]:
+    def set(self, slug: str, params: dict[str, str], *,
+            extra_allowed: dict[str, list[str]] | None = None) -> dict[str, str]:
         """Validate and persist ``params`` for ``slug``.
 
         Only keys listed in :data:`SCHEMA` for the slug are accepted. Pass an
-        empty dict to clear all overrides for the slug.
+        empty dict to clear all overrides for the slug. ``extra_allowed``
+        widens a whitelisted param with values the caller verified live (the
+        claude-code account model list).
 
         Raises :class:`SubAgentConfigError` on any invalid key/value.
         """
-        validated = self.validate(slug, params)
+        validated = self.validate(slug, params, extra_allowed=extra_allowed)
         with self._lock:
             if validated:
                 self._data[slug] = validated
@@ -294,7 +302,9 @@ class SubAgentConfigStore:
         return dict(validated)
 
     @staticmethod
-    def validate(slug: str, params: dict[str, str]) -> dict[str, str]:
+    def validate(slug: str, params: dict[str, str], *,
+                 extra_allowed: dict[str, list[str]] | None = None
+                 ) -> dict[str, str]:
         """Return a cleaned copy of ``params`` or raise SubAgentConfigError.
 
         - Unknown slug: rejects any non-empty params (empty is fine; no-op).
@@ -322,10 +332,13 @@ class SubAgentConfigStore:
                 # Empty string clears the param; do not persist.
                 continue
             schema = slug_schema[key]
-            if schema.allowed is not None and value not in schema.allowed:
+            extra = list((extra_allowed or {}).get(key) or [])
+            if (schema.allowed is not None and value not in schema.allowed
+                    and value not in extra):
+                allowed = extra + [v for v in schema.allowed if v not in extra]
                 raise SubAgentConfigError(
                     f"invalid value for {slug}.{key}: '{value}'. "
-                    f"Allowed: {list(schema.allowed)}"
+                    f"Allowed: {allowed}"
                 )
             cleaned[key] = value
         return cleaned

@@ -59,6 +59,21 @@ def _no_real_codex_probe(monkeypatch):
     _cm.clear_codex_models_cache()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_claude_probe(monkeypatch):
+    """Same hermeticity for the claude-code live model list: never spawn the
+    real claude CLI from unit tests."""
+    import agent_os.agent.transports.claude_models as _clm
+
+    async def _unavailable(binary="claude", **_kw):
+        return None
+
+    monkeypatch.setattr(_clm, "fetch_claude_models", _unavailable)
+    _clm.clear_claude_models_cache()
+    yield
+    _clm.clear_claude_models_cache()
+
+
 def _make_cli_manifest(slug="test-agent", command="testagent",
                       check_command="testagent --version") -> AgentManifest:
     return AgentManifest(
@@ -484,3 +499,86 @@ class TestCodexLiveModels:
                           json={"model": ""})
         assert resp.status_code == 200
         assert called == []
+
+
+# ---------------------------------------------------------------------------
+# 7. Claude Code live model list
+# ---------------------------------------------------------------------------
+
+class TestClaudeLiveModels:
+    """The claude-code dropdown follows the CLI's own account model list
+    (initialize → models[]), so a new generation (Opus 5.5, Fable 5.1) shows
+    up without a code change; the static whitelist is only the fallback."""
+
+    @staticmethod
+    def _patch_live(monkeypatch, result):
+        import agent_os.api.routes.settings as settings_routes
+
+        async def fake(binary=None):
+            if result is None:
+                return None
+            return [m if isinstance(m, dict) else {"value": m, "label": m}
+                    for m in result]
+
+        monkeypatch.setattr(settings_routes, "_claude_live_models", fake)
+
+    @staticmethod
+    def _claude(client):
+        resp = client.get("/api/v2/settings/sub-agents")
+        assert resp.status_code == 200
+        return next(e for e in resp.json() if e["slug"] == "claude-code")
+
+    def test_get_allowed_from_live_list(self, client, monkeypatch):
+        self._patch_live(monkeypatch, ["opus", "claude-fable-5-1[1m]", "sonnet"])
+        assert self._claude(client)["param_schema"]["model"]["allowed"] == [
+            "opus", "claude-fable-5-1[1m]", "sonnet"]
+
+    def test_get_carries_display_labels(self, client, monkeypatch):
+        self._patch_live(monkeypatch, [{"value": "opus", "label": "Opus 5.5"},
+                                       {"value": "sonnet", "label": "Sonnet 5"}])
+        model = self._claude(client)["param_schema"]["model"]
+        assert model["allowed"] == ["opus", "sonnet"]
+        assert model["labels"] == {"opus": "Opus 5.5", "sonnet": "Sonnet 5"}
+
+    def test_get_falls_back_to_static_list_with_current_generation(
+            self, client, monkeypatch):
+        self._patch_live(monkeypatch, None)
+        allowed = self._claude(client)["param_schema"]["model"]["allowed"]
+        for model in ("opus", "fable", "claude-opus-5-5", "claude-fable-5-1",
+                      "claude-sonnet-5", "claude-haiku-4-5"):
+            assert model in allowed
+
+    def test_get_keeps_a_saved_value_the_live_list_dropped(self, client,
+                                                           monkeypatch):
+        """A saved pin the account no longer lists must stay visible as the
+        selected value rather than render as a blank select."""
+        self._patch_live(monkeypatch, None)
+        assert client.put("/api/v2/settings/sub-agents/claude-code/config",
+                          json={"model": "claude-opus-4-8"}).status_code == 200
+        self._patch_live(monkeypatch, ["opus", "sonnet"])
+        allowed = self._claude(client)["param_schema"]["model"]["allowed"]
+        assert allowed[:2] == ["opus", "sonnet"]
+        assert "claude-opus-4-8" in allowed
+
+    def test_put_accepts_live_value_outside_static_list(self, client,
+                                                        monkeypatch):
+        self._patch_live(monkeypatch, ["claude-future-9", "opus"])
+        resp = client.put("/api/v2/settings/sub-agents/claude-code/config",
+                          json={"model": "claude-future-9"})
+        assert resp.status_code == 200
+        assert resp.json()["config"] == {"model": "claude-future-9"}
+
+    def test_put_rejects_value_in_neither_list(self, client, monkeypatch):
+        self._patch_live(monkeypatch, ["opus"])
+        resp = client.put("/api/v2/settings/sub-agents/claude-code/config",
+                          json={"model": "definitely-not-real"})
+        assert resp.status_code == 400
+        assert "definitely-not-real" in resp.json()["detail"]
+
+    def test_put_static_validation_when_live_unavailable(self, client,
+                                                         monkeypatch):
+        self._patch_live(monkeypatch, None)
+        assert client.put("/api/v2/settings/sub-agents/claude-code/config",
+                          json={"model": "claude-opus-5-5"}).status_code == 200
+        assert client.put("/api/v2/settings/sub-agents/claude-code/config",
+                          json={"model": "definitely-not-real"}).status_code == 400

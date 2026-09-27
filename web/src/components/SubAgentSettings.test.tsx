@@ -75,6 +75,7 @@ interface Entry {
   param_schema: Record<string, {
     allowed: string[] | null;
     default?: string | null;
+    labels?: Record<string, string> | null;
   }>;
   install?: InstallInfo;
   emits_tool_activity?: boolean;
@@ -391,6 +392,39 @@ describe('SubAgentSettings', () => {
     expect(screen.getByRole('option', { name: 'gpt-5.6' })).toBeInTheDocument();
     // The live options are still offered alongside it.
     expect(screen.getByRole('option', { name: 'gpt-5.5' })).toBeInTheDocument();
+  });
+
+  it('shows the CLI display names for live Claude Code models', async () => {
+    // The daemon forwards claude's own model list with displayName labels:
+    // the alias `opus` must read as "Opus 5.5", not the raw value, while an
+    // option with no label (a saved legacy pin) falls back to its value.
+    api.mockResolvedValueOnce([
+      makeEntry({
+        slug: 'claude-code',
+        name: 'Claude Code',
+        config: { model: 'claude-opus-4-8' },
+        param_schema: {
+          model: {
+            allowed: ['opus', 'claude-fable-5-1[1m]', 'claude-opus-4-8'],
+            default: null,
+            labels: { opus: 'Opus 5.5', 'claude-fable-5-1[1m]': 'Fable 5.1' },
+          },
+        },
+      }),
+    ]);
+
+    render(
+      <LocaleProvider>
+        <SubAgentSettings />
+      </LocaleProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('Claude Code')).toBeInTheDocument());
+    const opus = screen.getByRole('option', { name: 'Opus 5.5' }) as HTMLOptionElement;
+    expect(opus.value).toBe('opus');
+    expect(screen.getByRole('option', { name: 'Fable 5.1' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'claude-opus-4-8' })).toBeInTheDocument();
+    expect((screen.getByRole('combobox') as HTMLSelectElement).value).toBe('claude-opus-4-8');
   });
 });
 

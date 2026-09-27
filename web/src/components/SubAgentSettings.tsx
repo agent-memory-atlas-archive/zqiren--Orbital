@@ -21,6 +21,10 @@ interface ParamSchemaEntry {
   allowed: string[] | null;
   /** Effective runtime value when no override has been persisted. */
   default?: string | null;
+  /** Display names for ``allowed`` values, when the agent publishes them
+   *  (claude-code: the CLI's own model list, e.g. opus → "Opus 5.5").
+   *  Absent on older daemons; unlabeled values render as-is. */
+  labels?: Record<string, string> | null;
 }
 
 /** Orbital-managed install state for one agent. `supported` is false both for
@@ -813,7 +817,7 @@ function SubAgentCard({ entry, onChanged }: CardProps) {
                     )}
                     {schema.allowed.map(opt => (
                       <option key={opt} value={opt}>
-                        {paramOptionLabel(
+                        {schema.labels?.[opt] ?? paramOptionLabel(
                           entry.slug,
                           paramKey,
                           opt,

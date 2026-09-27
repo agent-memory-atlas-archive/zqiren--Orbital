@@ -679,6 +679,44 @@ async def _codex_live_models(binary: str | None = None) -> list[str] | None:
     return await get_codex_models_cached(binary or "codex")
 
 
+async def _claude_live_models(binary: str | None = None) -> list[dict] | None:
+    """Indirection over the cached claude-code model-list probe (monkeypatch
+    seam for route tests): ``[{"value", "label"}]``. None means "list
+    unavailable" — callers keep the static whitelist."""
+    from agent_os.agent.transports.claude_models import get_claude_models_cached
+    return await get_claude_models_cached(binary or "claude")
+
+
+async def _augment_claude_live_models(entries: list[dict]) -> list[dict]:
+    """Replace the claude-code model whitelist with the CLI's LIVE account
+    list (initialize → models[]), so a new model generation shows up without
+    a code change. A saved value the live list no longer offers is appended,
+    so the dropdown still shows what is actually configured. Probe failure
+    leaves the static whitelist."""
+    for entry in entries:
+        if entry.get("slug") != "claude-code":
+            continue
+        model_schema = (entry.get("param_schema") or {}).get("model")
+        if model_schema is None:
+            continue
+        models = await _claude_live_models(entry.get("binary_path"))
+        if models:
+            allowed = [m["value"] for m in models]
+            saved = (entry.get("config") or {}).get("model")
+            if saved and saved not in allowed:
+                allowed.append(saved)
+            model_schema["allowed"] = allowed
+            # Additive: the CLI's display names ("Opus 5.5") for the dropdown;
+            # older frontends ignore it and show the raw values.
+            model_schema["labels"] = {m["value"]: m["label"] for m in models}
+    return entries
+
+
+async def _augment_live_models(entries: list[dict]) -> list[dict]:
+    return await _augment_claude_live_models(
+        await _augment_codex_live_models(entries))
+
+
 async def _augment_codex_live_models(entries: list[dict]) -> list[dict]:
     """Replace the codex entry's free-text model schema with the account's
     LIVE model list when available (TASK-live-model-config).
@@ -710,7 +748,7 @@ async def list_sub_agent_settings():
     if _setup_engine is None:
         return []
     statuses = await asyncio.to_thread(_setup_engine.check_all)
-    return await _augment_codex_live_models([
+    return await _augment_live_models([
         _build_sub_agent_status_entry(s)
         for s in statuses
         if s.slug != "built-in"
@@ -766,8 +804,18 @@ async def put_sub_agent_config(slug: str, req: SubAgentConfigRequest):
             raise HTTPException(status_code=400, detail=(
                 f"invalid value for codex.model: '{codex_model}'. This "
                 f"account's codex CLI accepts: {live}"))
+    # claude-code: the account's live model list widens the static whitelist
+    # (a new generation is valid before this code learns its ids). Probe
+    # unavailable → the static whitelist alone still validates.
+    extra_allowed = None
+    claude_model = (params.get("model") or "").strip() if slug == "claude-code" else ""
+    if claude_model:
+        live_claude = await _claude_live_models()
+        if live_claude:
+            extra_allowed = {"model": [m["value"] for m in live_claude]}
     try:
-        cleaned = _sub_agent_config_store.set(slug, params)
+        cleaned = _sub_agent_config_store.set(slug, params,
+                                              extra_allowed=extra_allowed)
     except SubAgentConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"slug": slug, "config": cleaned}
@@ -792,9 +840,11 @@ async def refresh_sub_agent_status():
     # User-triggered refresh wants CURRENT state — drop the codex model/list
     # cache too so a just-fixed install / new model generation shows up.
     from agent_os.agent.transports.codex_models import clear_codex_models_cache
+    from agent_os.agent.transports.claude_models import clear_claude_models_cache
     clear_codex_models_cache()
+    clear_claude_models_cache()
     statuses = await asyncio.to_thread(_setup_engine.check_all)
-    return await _augment_codex_live_models([
+    return await _augment_live_models([
         _build_sub_agent_status_entry(s)
         for s in statuses
         if s.slug != "built-in"
