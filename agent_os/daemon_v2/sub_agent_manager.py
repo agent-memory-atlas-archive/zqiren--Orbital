@@ -19,6 +19,7 @@ from agent_os import telemetry
 from agent_os.agent.adapters.cli_adapter import CLIAdapter
 from agent_os.agent.prompt_builder import Autonomy
 from agent_os.agent.project_paths import ProjectPaths
+from agent_os.agents.setup_engine import StaleOkView
 from agent_os.daemon_v2.sub_agent_visibility import resolve_visible_sub_agent_slugs
 from agent_os.daemon_v2.models import (
     SessionKey,
@@ -510,6 +511,9 @@ class SubAgentManager:
         Pre-checks the on-disk resume source instead of trusting the resume
         call to fail loudly (claude-code prunes its store at ~30 days, and
         it is machine-local). A fresh start must never look like a resume.
+
+        Self-contained reads (session JSONL, resume-source files, psutil), so
+        the spawn path runs it in a worker thread (spec 101).
         """
         resolver = self._session_resolver
         session = resolver(project_id, session_id) if resolver else None
@@ -826,10 +830,15 @@ class SubAgentManager:
                 # Determine peer slugs (other enabled sub-agents in the project),
                 # honouring the project's disabled_sub_agents denylist so a
                 # disabled sub-agent is never listed as a peer either.
-                enabled_sub_agents = resolve_visible_sub_agent_slugs(
+                # Stale-ok and threaded (spec 101): an expired probe cache
+                # refreshes in the background, and an empty one probes in a
+                # worker thread, never on the loop.
+                enabled_sub_agents = await asyncio.to_thread(
+                    resolve_visible_sub_agent_slugs,
                     enabled_sub_agents=(project.get("enabled_sub_agents") if project else None),
                     disabled_sub_agents=(project.get("disabled_sub_agents") if project else None),
-                    setup_engine=self._setup_engine,
+                    setup_engine=(StaleOkView(self._setup_engine)
+                                  if self._setup_engine is not None else None),
                 )
                 if not enabled_sub_agents:
                     enabled_sub_agents = [handle]
@@ -905,8 +914,8 @@ class SubAgentManager:
             resume_record, resume_status, resume_reason = (
                 None, "fresh", "explicit_reset")
         else:
-            resume_record, resume_status, resume_reason = self._determine_resume(
-                workspace, project_id, handle, session_id,
+            resume_record, resume_status, resume_reason = await asyncio.to_thread(
+                self._determine_resume, workspace, project_id, handle, session_id,
             )
 
         # Resolve transport from manifest. An unrecognised transport hint
@@ -1180,7 +1189,7 @@ class SubAgentManager:
         # actually goes out (drain time for a queued one), so the block and
         # the marker written below agree on the watermark, and every entry
         # path — pinned, @mention, manager dispatch — gets the same block.
-        preamble = self._build_recap(adapter, project_id, session_id, handle)
+        preamble = await self._build_recap(adapter, project_id, session_id, handle)
         try:
             await self._dispatch_async(
                 adapter, project_id, handle, preamble + prompt.message,
@@ -1200,14 +1209,18 @@ class SubAgentManager:
                 dispatch_id=prompt.dispatch_id,
             )
 
-    def _build_recap(self, adapter, project_id: str, session_id: str,
-                     handle: str) -> str:
+    async def _build_recap(self, adapter, project_id: str, session_id: str,
+                           handle: str) -> str:
         """The "Conversation so far" block for this dispatch, or "".
 
         A FRESH spawn's first dispatch gets the whole session (its thread is
         empty); after that, and for a resumed thread, only the gap since the
         worker's last dispatch marker. Never raises — a recap failure must
         not block a dispatch.
+
+        The session read runs in a worker thread (spec 101): a pinned chat's
+        manager handle is usually evicted, so the resolver parses the whole
+        JSONL and re-encodes its image blobs from disk.
         """
         from agent_os.daemon_v2.recap import build_recap
 
@@ -1220,7 +1233,7 @@ class SubAgentManager:
             and getattr(adapter, "_recap_primed", None) is not True
         )
         try:
-            session = resolver(project_id, session_id)
+            session = await asyncio.to_thread(resolver, project_id, session_id)
             messages = session.get_messages() if session is not None else []
             block = build_recap(messages, handle, fresh=bool(fresh))
         except Exception:
@@ -1993,7 +2006,9 @@ class SubAgentManager:
         # completed turn's on_thread_update overwrite).
         try:
             resolver = self._session_resolver
-            session = resolver(project_id, session_id) if resolver else None
+            # Read off the loop (spec 101); the record write below stays on it.
+            session = (await asyncio.to_thread(resolver, project_id, session_id)
+                       if resolver else None)
             record = (session.get_sub_agent_thread(handle)
                       if session is not None else None)
             if session is not None and record and record.get("session_id"):

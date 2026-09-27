@@ -1468,7 +1468,9 @@ async def inject_message(project_id: str, req: InjectRequest):
         # resolved concrete session id for dispatch + ack + lifecycle. A pure
         # resolve-then-append: it never starts/queues the management loop.
         # ``inject_session_id`` is the raw request value; the mention
-        # persist below resolves it through the canonical funnel.
+        # persist below resolves it through the canonical funnel. It is async
+        # (spec 101: the disk hydrate runs off the loop), so each attempt's
+        # coroutine is awaited by _retry_session_lock; the append stays here.
         try:
             mention_session_id = await _retry_session_lock(
                 lambda: _agent_manager.persist_mention_message(
@@ -1921,7 +1923,7 @@ async def patch_session(project_id: str, session_id: str, req: SessionPatchReque
                 detail="'orbital' is reserved for the management agent and "
                        "cannot be pinned",
             )
-        installed = {e["slug"] for e in _installed_sub_agents()}
+        installed = {e["slug"] for e in await asyncio.to_thread(_installed_sub_agents)}
         if slug not in installed:
             raise HTTPException(
                 status_code=422,
@@ -4087,7 +4089,7 @@ async def list_sub_agent_memory(project_id: str):
     workspace = project.get("workspace", "")
     if not workspace:
         return []
-    available = _installed_sub_agents()
+    available = await asyncio.to_thread(_installed_sub_agents)
     out: list[dict] = []
     for entry in available:
         slug = entry["slug"]
@@ -4151,7 +4153,9 @@ async def update_sub_agent_memory(
 
     # Validate that this slug is among the available sub-agents for this
     # project. Disabled / unknown / not-installed sub-agents are rejected.
-    available_slugs = {e["slug"] for e in _resolve_available_sub_agents(project)}
+    available_slugs = {
+        e["slug"] for e in await asyncio.to_thread(_resolve_available_sub_agents, project)
+    }
     if agent_slug not in available_slugs:
         raise HTTPException(
             status_code=400,

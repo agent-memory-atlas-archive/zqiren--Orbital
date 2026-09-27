@@ -34,7 +34,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
 
@@ -329,59 +330,183 @@ def _parse_ts(ts: str) -> datetime:
     return dt
 
 
+def _parse_line(raw: bytes):
+    """One ledger line → ``(ts, rec)``, or None for a blank/unusable line.
+
+    Raises ``ValueError`` for a malformed line (the caller counts skips).
+    """
+    line = raw.strip()
+    if not line:
+        return None
+    try:
+        rec = json.loads(line)
+        if not isinstance(rec, dict):
+            raise ValueError("line is not a JSON object")
+        # Required fields for cost attribution. A line missing any of these is
+        # unusable; skip it.
+        _ = (rec["ts"], rec["provider"], rec["model"], rec["source"])
+        # Validate the timestamp eagerly so the per-line skip happens here
+        # (not mid-aggregation).
+        ts = _parse_ts(rec["ts"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError(str(exc)) from exc
+    return ts, rec
+
+
+@dataclass
+class _LedgerCache:
+    """What has been parsed out of one ledger file (spec 101 §4-C).
+
+    The ledger is append-only, so a read only needs the bytes past ``offset``
+    (the end of the last COMPLETE line). A trailing line with no newline yet
+    is parsed per read into ``tail`` but never folded into ``records`` — the
+    writer may still be mid-line. ``aggs`` memoizes ``spend()``'s per-group
+    sums per ``(window start, source filter)`` as ``[rows folded, groups,
+    reported]``, so a repeat query folds only the rows appended since.
+    """
+
+    ino: int
+    dev: int
+    size: int = 0
+    mtime_ns: int = 0
+    offset: int = 0
+    lines: int = 0
+    records: list = field(default_factory=list)
+    tail: list = field(default_factory=list)
+    aggs: dict = field(default_factory=dict)
+
+
+# Bound on memoized spend() views per file: the daily window rolls over, and
+# the display route asks for several windows.
+_MAX_AGGS_PER_FILE = 16
+
+_cache: dict[str, _LedgerCache] = {}
+# Guards ``_cache`` and every entry in it: spend() runs on the event loop
+# (budget guard, append hook) and from threaded routes.
+_cache_lock = threading.Lock()
+
+
+def _clear_cache() -> None:
+    """Forget every parsed ledger (tests; nothing in production needs it)."""
+    with _cache_lock:
+        _cache.clear()
+
+
+def _read_ledger(path: str) -> _LedgerCache | None:
+    """Bring the cache for ``path`` up to date and return it (lock held).
+
+    Unchanged file (same inode, size and mtime) → no I/O beyond one stat.
+    Grown file → read and parse only the bytes past ``offset``. Anything else
+    (shrunk, rewritten in place at the same size, replaced by another inode,
+    or the byte before ``offset`` is no longer a newline) → full re-read.
+    Returns None if the file does not exist or cannot be opened.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        _cache.pop(path, None)
+        return None
+    entry = _cache.get(path)
+    if (entry is not None and (entry.ino, entry.dev) == (st.st_ino, st.st_dev)
+            and st.st_size == entry.size and st.st_mtime_ns == entry.mtime_ns):
+        return entry
+    if (entry is None or (entry.ino, entry.dev) != (st.st_ino, st.st_dev)
+            or st.st_size <= entry.size):
+        entry = _LedgerCache(ino=st.st_ino, dev=st.st_dev)
+    try:
+        f = open(path, "rb")
+    except OSError:
+        logger.warning("ledger read failed to open %s; treating as empty", path,
+                       exc_info=True)
+        _cache.pop(path, None)
+        return None
+    with f:
+        if entry.offset:
+            f.seek(entry.offset - 1)
+            if f.read(1) != b"\n":
+                entry = _LedgerCache(ino=st.st_ino, dev=st.st_dev)
+                f.seek(0)
+        data = f.read()
+        after = os.fstat(f.fileno())
+    cut = data.rfind(b"\n") + 1
+    skipped = 0
+    first_bad_lineno: int | None = None
+    for raw in data[:cut].split(b"\n")[:-1]:
+        entry.lines += 1
+        try:
+            parsed = _parse_line(raw)
+        except ValueError:
+            skipped += 1
+            if first_bad_lineno is None:
+                first_bad_lineno = entry.lines
+            continue
+        if parsed is not None:
+            entry.records.append(parsed)
+    entry.tail = []
+    if data[cut:]:
+        try:
+            parsed = _parse_line(data[cut:])
+        except ValueError:
+            skipped += 1
+            if first_bad_lineno is None:
+                first_bad_lineno = entry.lines + 1
+        else:
+            if parsed is not None:
+                entry.tail.append(parsed)
+    entry.offset += cut
+    entry.size = entry.offset + len(data) - cut
+    entry.mtime_ns = after.st_mtime_ns
+    _cache[path] = entry
+    if skipped:
+        # ONE summary WARNING per read of new bytes (not per line, and not
+        # again for bytes already read), so a corrupted file polled by GET
+        # /cost cannot flood the log.
+        logger.warning(
+            "skipped %d malformed ledger line(s) in %s (first at line %d)",
+            skipped, path, first_bad_lineno,
+        )
+    return entry
+
+
 def _iter_events(path: str):
     """Yield parsed event dicts from a ledger file, skipping bad lines.
 
     Malformed / legacy lines (unparseable JSON, missing required keys, bad
     timestamps) are skipped — a corrupt line must never crash a read-only
-    query. Skips are reported as ONE summary WARNING per read (not per line),
-    so a heavily corrupted file polled by GET /cost cannot flood the log.
-    Returns nothing if the file does not exist.
+    query. Returns nothing if the file does not exist. Reads go through the
+    incremental cache (``_read_ledger``), so only new bytes are parsed.
     """
-    if not os.path.exists(path):
-        return
-    try:
-        f = open(path, "r", encoding="utf-8")
-    except OSError:
-        logger.warning("ledger read failed to open %s; treating as empty", path,
-                       exc_info=True)
-        return
-    skipped = 0
-    first_bad_lineno: int | None = None
-    with f:
-        for lineno, raw in enumerate(f, start=1):
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-                if not isinstance(rec, dict):
-                    raise ValueError("line is not a JSON object")
-                # Required fields for cost attribution. A line missing any of
-                # these is unusable; skip it.
-                _ = (
-                    rec["ts"],
-                    rec["provider"],
-                    rec["model"],
-                    rec["source"],
-                )
-                # Validate the timestamp eagerly so the per-line skip happens
-                # here (not mid-aggregation).
-                _parse_ts(rec["ts"])
-            except (ValueError, KeyError, TypeError):
-                skipped += 1
-                if first_bad_lineno is None:
-                    first_bad_lineno = lineno
-                continue
-            yield rec
-    if skipped:
-        logger.warning(
-            "skipped %d malformed ledger line(s) in %s (first at line %d)",
-            skipped, path, first_bad_lineno,
-        )
+    with _cache_lock:
+        entry = _read_ledger(path)
+        rows = [] if entry is None else entry.records + entry.tail
+    for _ts, rec in rows:
+        yield rec
 
 
 _TOKEN_FIELDS = ("uncached_input", "cache_read", "cache_write", "output")
+
+
+def _fold(groups: dict, reported: dict, rows, start_utc: datetime,
+          source_filter: set | None) -> None:
+    """Add ``rows`` (``(ts, rec)`` pairs) into ``spend()``'s group sums."""
+    for ts, rec in rows:
+        if ts < start_utc:
+            continue
+        if source_filter is not None and rec["source"] not in source_filter:
+            continue
+        key = (rec["provider"], rec["model"], rec["source"])
+        bucket = groups.setdefault(key, {f: 0 for f in _TOKEN_FIELDS})
+        for fld in _TOKEN_FIELDS:
+            val = rec.get(fld, 0)
+            if isinstance(val, int):
+                bucket[fld] += val
+        # Provider-reported cost is optional and additive across a group's rows.
+        rc = rec.get("reported_cost")
+        if isinstance(rc, (int, float)):
+            ccy = rec.get("reported_cost_currency")
+            if isinstance(ccy, str) and ccy:
+                rbucket = reported.setdefault(key, {})
+                rbucket[ccy] = rbucket.get(ccy, 0.0) + float(rc)
 
 
 def _convert(amount: float, from_ccy: str, to_ccy: str, fx_rates: dict) -> float | None:
@@ -473,34 +598,33 @@ def spend(
     source_filter = None if sources is None else set(sources)
 
     # Aggregate token counts by (provider, model, source). Cost is derived AFTER
-    # accumulation so we never round mid-sum.
+    # accumulation so we never round mid-sum. The sums are memoized per
+    # (window start, filter) on the file's cache entry and folded forward over
+    # only the rows appended since the last query (spec 101 §4-C); the budget
+    # guard runs this at the top of every loop iteration.
+    #
+    # Provider-reported cost (P3-B) is accumulated per group, keyed by
+    # currency so a group never mixes currencies. Only sub-agent rows carry it
+    # (claude-code total_cost_usd); displayed verbatim, never recomputed from
+    # our rates.
     groups: dict[tuple[str, str, str], dict[str, int]] = {}
-    # Provider-reported cost (P3-B) accumulated per group, keyed by currency so
-    # a group never mixes currencies. Only sub-agent rows carry it (claude-code
-    # total_cost_usd); displayed verbatim, never recomputed from our rates.
     reported: dict[tuple[str, str, str], dict[str, float]] = {}
-    for rec in _iter_events(path):
-        try:
-            ts = _parse_ts(rec["ts"])
-        except (ValueError, TypeError):
-            continue  # already filtered in _iter_events, but be defensive
-        if ts < start_utc:
-            continue
-        if source_filter is not None and rec["source"] not in source_filter:
-            continue
-        key = (rec["provider"], rec["model"], rec["source"])
-        bucket = groups.setdefault(key, {f: 0 for f in _TOKEN_FIELDS})
-        for fld in _TOKEN_FIELDS:
-            val = rec.get(fld, 0)
-            if isinstance(val, int):
-                bucket[fld] += val
-        # Provider-reported cost is optional and additive across a group's rows.
-        rc = rec.get("reported_cost")
-        if isinstance(rc, (int, float)):
-            ccy = rec.get("reported_cost_currency")
-            if isinstance(ccy, str) and ccy:
-                rbucket = reported.setdefault(key, {})
-                rbucket[ccy] = rbucket.get(ccy, 0.0) + float(rc)
+    agg_key = (start_utc, None if source_filter is None else frozenset(source_filter))
+    with _cache_lock:
+        entry = _read_ledger(path)
+        if entry is not None:
+            agg = entry.aggs.pop(agg_key, None)
+            if agg is None:
+                agg = [0, {}, {}]
+            _fold(agg[1], agg[2], entry.records[agg[0]:], start_utc, source_filter)
+            agg[0] = len(entry.records)
+            entry.aggs[agg_key] = agg  # re-inserted last = most recently used
+            while len(entry.aggs) > _MAX_AGGS_PER_FILE:
+                entry.aggs.pop(next(iter(entry.aggs)))
+            groups = {k: dict(v) for k, v in agg[1].items()}
+            reported = {k: dict(v) for k, v in agg[2].items()}
+            # The unterminated last line counts for this read only.
+            _fold(groups, reported, entry.tail, start_utc, source_filter)
 
     breakdown: list[dict] = []
     by_currency: dict[str, float] = {}

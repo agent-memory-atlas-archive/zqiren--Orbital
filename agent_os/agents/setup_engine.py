@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 
 from agent_os.agents.manifest import AgentManifest
@@ -36,6 +37,18 @@ CHECK_ALL_CACHE_TTL_SECONDS = 60
 # differ) and so cannot be written into the read-only bundled manifest.
 # ``runtime.command`` and ``runtime.args`` stay strict passthrough.
 ORBITAL_DATA_DIR_TOKEN = "${ORBITAL_DATA_DIR}"
+
+
+class StaleOkView:
+    """A ``check_all()`` view that serves an expired result instead of
+    re-probing (spec 101), for code that takes an engine and calls plain
+    ``check_all()`` on the event loop (``resolve_visible_sub_agent_slugs``)."""
+
+    def __init__(self, engine) -> None:
+        self._engine = engine
+
+    def check_all(self):
+        return self._engine.check_all(allow_stale=True)
 
 
 class SetupEngine:
@@ -63,6 +76,15 @@ class SetupEngine:
         # In-memory cache of the last check_all() result. Tuple of
         # (results, expires_at_monotonic). None when empty or invalidated.
         self._check_all_cache: tuple[list[AgentSetupStatus], float] | None = None
+        # Single-flight guard for the probe sweep (spec 101): concurrent cold
+        # callers — threaded routes, a stale-serve refresh — wait for ONE
+        # sweep instead of each spawning ~13 CLI subprocesses.
+        self._probe_lock = threading.Lock()
+        # Bumped by invalidate_cache(). A sweep that started before an
+        # invalidation may have probed an agent before the install/login
+        # finished, so its result is returned to its caller but not cached.
+        self._cache_generation = 0
+        self._refresh_thread: threading.Thread | None = None
 
     def set_sub_agent_config_store(self, store) -> None:
         """Late-bind the sub-agent config store (called by app factory)."""
@@ -137,34 +159,73 @@ class SetupEngine:
             credential_state=credential_state,
         )
 
-    def check_all(self) -> list[AgentSetupStatus]:
+    def check_all(self, allow_stale: bool = False) -> list[AgentSetupStatus]:
         """Status check for all registered agents.
 
         Cached for ``CHECK_ALL_CACHE_TTL_SECONDS``. Use ``invalidate_cache()``
         to force a re-check (e.g. after an install or login action).
+
+        ``allow_stale=True`` is for callers on a latency-critical path (turn
+        start, spec 101): an expired result is returned at once and a single
+        background sweep refreshes it. Only a cache that was never filled, or
+        was invalidated, still probes before returning.
         """
-        if self._check_all_cache is not None:
-            results, expires_at = self._check_all_cache
+        cached = self._check_all_cache
+        if cached is not None:
+            results, expires_at = cached
             if time.monotonic() < expires_at:
                 return results
+            if allow_stale:
+                self._refresh_in_background()
+                return results
+        return self._probe_all()
 
-        results = []
-        for manifest in self._registry.list_all():
-            results.append(self.check_agent(manifest.slug))
+    def _probe_all(self) -> list[AgentSetupStatus]:
+        """Run the sweep once, however many callers ask at the same time."""
+        with self._probe_lock:
+            # Another caller may have finished a sweep while we waited.
+            cached = self._check_all_cache
+            if cached is not None and time.monotonic() < cached[1]:
+                return cached[0]
+            generation = self._cache_generation
+            results = []
+            for manifest in self._registry.list_all():
+                results.append(self.check_agent(manifest.slug))
+            if generation == self._cache_generation:
+                self._check_all_cache = (
+                    results,
+                    time.monotonic() + CHECK_ALL_CACHE_TTL_SECONDS,
+                )
+            return results
 
-        self._check_all_cache = (
-            results,
-            time.monotonic() + CHECK_ALL_CACHE_TTL_SECONDS,
-        )
-        return results
+    def _refresh_in_background(self) -> None:
+        """Start one daemon-thread sweep unless one is already running."""
+        if self._probe_lock.locked():
+            return
+        thread = self._refresh_thread
+        if thread is not None and thread.is_alive():
+            return
+
+        def _run() -> None:
+            try:
+                self._probe_all()
+            except Exception:
+                logger.warning("background check_all refresh failed", exc_info=True)
+
+        thread = threading.Thread(target=_run, name="check-all-refresh", daemon=True)
+        self._refresh_thread = thread
+        thread.start()
 
     def invalidate_cache(self) -> None:
         """Drop the cached ``check_all()`` result.
 
         Call this after any orbital-driven action that could change
         agent install/auth status (install, login, logout, etc.) so that
-        the next ``check_all()`` re-probes the system.
+        the next ``check_all()`` re-probes the system. This also drops the
+        copy ``allow_stale`` would serve, and keeps a sweep already in flight
+        from writing its (possibly pre-install) result back.
         """
+        self._cache_generation += 1
         self._check_all_cache = None
 
     def invalidate_resolved_path(self, slug: str) -> None:

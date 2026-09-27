@@ -536,7 +536,7 @@ class QueueDispatcher:
         management-agent retry does with ``_retry_attempt_handler``.
         """
         try:
-            self._agent_manager.persist_mention_message(
+            await self._agent_manager.persist_mention_message(
                 self._project_id, session_id,
                 {
                     "role": "user",
