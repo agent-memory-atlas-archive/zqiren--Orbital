@@ -13,7 +13,13 @@ import logging
 from collections import deque
 from datetime import datetime, timezone
 
+from agent_os.daemon_v2.activity_translator import worker_display_meta
+
 logger = logging.getLogger(__name__)
+
+# Spec 100: worker chunks whose detail is shown live in the chat capsule and
+# kept on the transcript row. Display-only: none of it reaches the manager.
+_WORKER_DISPLAY_CHUNKS = ("tool_activity", "tool_result", "thinking")
 
 
 def _now() -> str:
@@ -161,6 +167,19 @@ class ProcessManager:
         if not dq:
             self._active_dispatch_id.pop(key, None)
 
+    def _current_dispatch(self, key: str) -> "str | None":
+        """The dispatch_id of the turn in flight on ``key`` (the OLDEST queued
+        id — the one the next boundary will pop), or None."""
+        dq = self._active_dispatch_id.get(key)
+        return dq[0] if dq else None
+
+    def _close_worker_display(self, project_id: str, handle: str,
+                              session_id: "str | None") -> None:
+        """Spec 100: flush a closing turn's pending live thinking."""
+        closer = getattr(self._activity_translator, "on_worker_turn_closed", None)
+        if closer is not None:
+            closer(project_id, session_id=session_id, handle=handle)
+
     def _pop_active_dispatch(self, key: str) -> "str | None":
         """Pop and return the OLDEST enqueued dispatch_id for ``key``, or
         ``None`` if none is pending. Called at every boundary write so each
@@ -304,6 +323,7 @@ class ProcessManager:
                         # stamps ONLY this boundary, in FIFO order — a later
                         # turn with no fresh send() call must never inherit
                         # a stale id (TASK-dispatch-id-pairing).
+                        self._close_worker_display(project_id, handle, session_id)
                         self._append_turn_boundary(
                             transcript, handle,
                             self._pop_active_dispatch(key))
@@ -374,6 +394,22 @@ class ProcessManager:
                         "timestamp": _now(),
                         "chunk_type": chunk.chunk_type,
                     }
+                    # Spec 100: additive fields (every reader branches on
+                    # chunk_type and ignores unknown keys). ``metadata`` is the
+                    # display slice of a tool/thinking chunk, so a reload shows
+                    # what the live capsule showed; ``dispatch_id`` ties an
+                    # in-flight turn's rows to its dispatch marker before the
+                    # closing boundary exists.
+                    display = None
+                    if chunk.chunk_type in _WORKER_DISPLAY_CHUNKS:
+                        display = worker_display_meta(
+                            chunk.chunk_type,
+                            getattr(chunk, "metadata", None))
+                        if display:
+                            entry["metadata"] = display
+                    current_dispatch = self._current_dispatch(key)
+                    if current_dispatch:
+                        entry["dispatch_id"] = current_dispatch
                     # Write to sub-agent transcript (v5: never to management session)
                     if transcript is not None:
                         transcript.append(entry)
@@ -453,17 +489,28 @@ class ProcessManager:
                             "recent_activity": [],
                             })
 
-                    self._activity_translator.on_message(
-                        {"role": "agent", "source": handle, "content": chunk.text, "timestamp": entry["timestamp"]},
-                        project_id,
-                        session_id=session_id,
-                    )
+                    on_worker_chunk = getattr(
+                        self._activity_translator, "on_worker_chunk", None)
+                    if display is not None and on_worker_chunk is not None:
+                        # Spec 100: live capsule rows / thinking, in place of
+                        # the agent_output echo every frontend drops.
+                        on_worker_chunk(
+                            chunk.chunk_type, display, chunk.text, project_id,
+                            session_id=session_id, handle=handle,
+                        )
+                    else:
+                        self._activity_translator.on_message(
+                            {"role": "agent", "source": handle, "content": chunk.text, "timestamp": entry["timestamp"]},
+                            project_id,
+                            session_id=session_id,
+                        )
 
                 # Stream ended. With an open turn this is an abnormal death
                 # (process died without any completion signal — path c); a
                 # closed or never-opened turn is a clean teardown and must
                 # emit NOTHING. The old unconditional on_completed here is
                 # what stamped "completed" on killed sub-agents.
+                self._close_worker_display(project_id, handle, session_id)
                 if self._turn_open.get(key):
                     # FIFO desync guard, closure requested after re-review
                     # (TASK-dispatch-id-pairing): no turn_complete was ever
@@ -539,6 +586,7 @@ class ProcessManager:
         """
         key = self._key(project_id, session_id, handle)
         self._turn_open[key] = False
+        self._close_worker_display(project_id, handle, session_id)
         self._append_turn_boundary(
             self._transcripts.get(key), handle,
             self._pop_active_dispatch(key))

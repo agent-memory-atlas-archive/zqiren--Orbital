@@ -2721,6 +2721,14 @@ def _interleave_sub_agent_summaries(messages: list[dict]) -> list[dict]:
       internally) turning one turn into two bubbles; it does not fix that
       root cause.
 
+    - Spec 100: a dispatch still in flight whose transcript rows carry its
+      id (``include_in_flight``) renders its capsule so far — tool rows and
+      thinking, ``sub_agent_in_flight: true``, no response yet — so a reload
+      mid-run shows what the live view showed. Live events then extend it.
+    - Spec 100: tool rows carry ``tool_call_id`` / ``arguments`` / the
+      result preview when the transcript has them, and the turn's thinking
+      rides ``sub_agent_thinking`` (only when non-empty). Display-only.
+
     Read-only and best-effort: a missing/unreadable transcript is a no-op.
     Operates on the already-paginated page, so it never changes the total-count
     math — and it NEVER persists. The full text lives ONLY on this display
@@ -2749,7 +2757,8 @@ def _interleave_sub_agent_summaries(messages: list[dict]) -> list[dict]:
             continue
         if transcript_path not in slices_by_path:
             try:
-                slices_by_path[transcript_path] = read_sub_agent_summary(transcript_path)
+                slices_by_path[transcript_path] = read_sub_agent_summary(
+                    transcript_path, include_in_flight=True)
             except Exception:
                 slices_by_path[transcript_path] = None
         slices = slices_by_path[transcript_path]
@@ -2760,21 +2769,31 @@ def _interleave_sub_agent_summaries(messages: list[dict]) -> list[dict]:
         if turn is None:
             # Still in flight (no closing boundary yet) or an unknown id.
             continue
-        if not (turn.get("response") or "").strip():
+        in_flight = bool(turn.get("in_flight"))
+        if in_flight:
+            if not turn.get("tool_rows") and not turn.get("thinking"):
+                continue  # nothing to show yet
+        elif not (turn.get("response") or "").strip():
             # Errored / interrupted / tool-only turn: let the existing terminal
             # marker one-liner speak. Never alias a neighboring turn's text.
             continue
         seen_dispatch_keys.add(dispatch_key)
-        out.append({
+        row = {
             "role": "assistant",
-            "content": turn.get("response") or "",
+            # An in-flight turn's latest text is not its answer yet.
+            "content": "" if in_flight else (turn.get("response") or ""),
             "source": "sub_agent",
             "sub_agent_handle": meta.get("handle", ""),
             "sub_agent_tool_rows": turn.get("tool_rows", []),
             "sub_agent_duration": turn.get("total_duration_seconds", 0.0),
             "timestamp": msg.get("timestamp", ""),
             "session_id": msg.get("session_id"),
-        })
+        }
+        if turn.get("thinking"):
+            row["sub_agent_thinking"] = turn["thinking"]
+        if in_flight:
+            row["sub_agent_in_flight"] = True
+        out.append(row)
     return out
 
 

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Orbital Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   Send, Loader2, Plus, ChevronRight, ChevronDown, ArrowDown,
   Clock, CornerDownLeft, FolderSearch, ListChecks, type LucideIcon,
@@ -19,7 +19,9 @@ import {
   truncateResult,
   mergeRecoveredAssistantMessage,
   describeLiveActivity,
+  describeWorkerTool,
   dispatchFromToolCall,
+  workerToolCategory,
 } from '../utils/chatTransform';
 import type { DisplayItem, ResultTotals } from '../utils/chatTransform';
 import { isWorkerHandle } from '../utils/subAgentHandle';
@@ -121,12 +123,17 @@ function capsuleSummaryText(capsule: AgentRunItem, tr: CapsuleTr = EN_CAPSULE): 
   return line;
 }
 
+// Spec 100: every live-capsule helper below takes an `owner`: undefined for
+// the management agent (its capsules carry no `source`), or a sub-agent
+// handle (its capsules carry `source: handle`). A running capsule at the tail
+// is extended only by events of its own owner.
 function getLiveRunningCapsule(
   items: DisplayItem[],
+  owner?: string,
 ): { idx: number; capsule: AgentRunItem } | null {
   if (items.length === 0) return null;
   const last = items[items.length - 1];
-  if (last.type === 'agent_run' && last.status === 'running') {
+  if (last.type === 'agent_run' && last.status === 'running' && last.source === owner) {
     return { idx: items.length - 1, capsule: last };
   }
   return null;
@@ -136,9 +143,10 @@ function appendToLiveCapsule(
   prev: DisplayItem[],
   child: CapsuleChild,
   timestamp: string,
+  owner?: string,
 ): DisplayItem[] {
   const ms = Date.parse(timestamp);
-  const live = getLiveRunningCapsule(prev);
+  const live = getLiveRunningCapsule(prev, owner);
   if (!live) {
     const id = `cap:live:${ms}:${Math.random().toString(36).slice(2, 8)}`;
     const counts: Record<string, number> = {};
@@ -154,6 +162,7 @@ function appendToLiveCapsule(
       has_thinking: hasThinking,
       started_at: ms,
       ended_at: null,
+      ...(owner ? { source: owner } : {}),
     };
     return [...prev, fresh];
   }
@@ -188,8 +197,9 @@ export function appendLiveReasoning(
   reasoning: string,
   timestamp: string,
   source: string,
+  owner?: string,
 ): DisplayItem[] {
-  const live = getLiveRunningCapsule(prev);
+  const live = getLiveRunningCapsule(prev, owner);
   // Find a trailing reasoning_block in the running capsule to extend.
   if (live) {
     const items = live.capsule.items;
@@ -220,6 +230,7 @@ export function appendLiveReasoning(
       prev,
       { type: 'reasoning_block', content: reasoning, timestamp, turn_id: timestamp },
       timestamp,
+      owner,
     );
   }
 
@@ -230,30 +241,92 @@ export function appendLiveReasoning(
   // (it is indented to sit under a header); without this anchor the live
   // thinking floats unattributed — and in cold-start (no preceding user
   // message) it is not attributed to the management agent at all.
+  return appendToLiveCapsule(
+    anchorAgentHeader(prev, source, timestamp, owner),
+    { type: 'reasoning_block', content: reasoning, timestamp, turn_id: timestamp },
+    timestamp,
+    owner,
+  );
+}
+
+/** Prepend-anchor for a fresh live capsule: the header-only agent_message
+ * that attributes it. The management agent's capsule is anchored by any
+ * preceding agent row; a sub-agent's only by its OWN header or bubble —
+ * otherwise its run would sit under the manager's (or another worker's)
+ * avatar. */
+function anchorAgentHeader(
+  prev: DisplayItem[],
+  source: string,
+  timestamp: string,
+  owner?: string,
+): DisplayItem[] {
   const lastItem = prev[prev.length - 1];
-  const anchored =
-    !!lastItem &&
-    (lastItem.type === 'agent_message' ||
-      lastItem.type === 'sub_agent_message' ||
-      lastItem.type === 'agent_run');
-  const base: DisplayItem[] = anchored
+  const anchored = owner
+    ? !!lastItem &&
+      (lastItem.type === 'agent_message' || lastItem.type === 'sub_agent_message') &&
+      lastItem.source === owner
+    : !!lastItem &&
+      (lastItem.type === 'agent_message' ||
+        lastItem.type === 'sub_agent_message' ||
+        lastItem.type === 'agent_run');
+  return anchored
     ? prev
     : [
         ...prev,
         { type: 'agent_message', content: '', source, timestamp, isHeaderOnly: true },
       ];
+}
+
+/** Spec 100: a sub-agent's live tool call. Opens (and anchors) the worker's
+ * capsule on the first call; a call already in it — a codex completion or
+ * an ACP progress update adding a title or arguments — updates its row in
+ * place, never appends a second one. */
+export function upsertWorkerToolRow(
+  prev: DisplayItem[],
+  owner: string,
+  row: ToolCallRowItem,
+): DisplayItem[] {
+  const live = getLiveRunningCapsule(prev, owner);
+  if (live) {
+    const items = live.capsule.items;
+    const k = items.findIndex(
+      (c) => c.type === 'tool_call_row' && c.tool_call_id === row.tool_call_id,
+    );
+    if (k >= 0) {
+      const existing = items[k] as ToolCallRowItem;
+      const counts = { ...live.capsule.tool_call_count_by_name };
+      if (existing.tool_name !== row.tool_name) {
+        counts[existing.tool_name] = (counts[existing.tool_name] ?? 1) - 1;
+        if (counts[existing.tool_name] <= 0) delete counts[existing.tool_name];
+        counts[row.tool_name] = (counts[row.tool_name] ?? 0) + 1;
+      }
+      const newItems = [...items];
+      newItems[k] = {
+        ...existing,
+        tool_name: row.tool_name,
+        target_description: row.target_description,
+        category: row.category,
+      };
+      const next = [...prev];
+      next[live.idx] = { ...live.capsule, items: newItems, tool_call_count_by_name: counts };
+      return next;
+    }
+    return appendToLiveCapsule(prev, row, row.timestamp, owner);
+  }
   return appendToLiveCapsule(
-    base,
-    { type: 'reasoning_block', content: reasoning, timestamp, turn_id: timestamp },
-    timestamp,
+    anchorAgentHeader(prev, owner, row.timestamp, owner),
+    row,
+    row.timestamp,
+    owner,
   );
 }
 
 function finalizeLiveCapsule(
   prev: DisplayItem[],
   status: 'completed' | 'error' | 'stopped',
+  owner?: string,
 ): DisplayItem[] {
-  const live = getLiveRunningCapsule(prev);
+  const live = getLiveRunningCapsule(prev, owner);
   if (!live) return prev;
   if (live.capsule.items.length === 0) {
     return prev.slice(0, live.idx);
@@ -339,6 +412,90 @@ function ToolCallRow({ row }: { row: ToolCallRowItem }): React.ReactNode {
   );
 }
 
+// Spec 100 §3.4.8: the transcript renders every item on every setItems (no
+// virtualization), so the heavy rows are memoized: a live event that
+// replaces one item re-renders that row only. Items are immutable (each
+// update copies the changed item), so identity is the change signal.
+const MemoChatMessage = memo(ChatMessage);
+
+interface AgentRunCapsuleProps {
+  item: AgentRunItem;
+  derivedStatus: AgentRunItem['status'];
+  isExpanded: boolean;
+  onToggle: (capsuleId: string) => void;
+}
+
+const AgentRunCapsule = memo(function AgentRunCapsule({
+  item,
+  derivedStatus,
+  isExpanded,
+  onToggle,
+}: AgentRunCapsuleProps): React.ReactNode {
+  const t = useT();
+  const isLocked = derivedStatus === 'running';
+  const summary = capsuleSummaryText({ ...item, status: derivedStatus }, t);
+  const Chevron = isExpanded ? ChevronDown : ChevronRight;
+  return (
+    <div
+      data-testid="agent_run"
+      data-capsule-id={item.capsule_id}
+      data-capsule-status={derivedStatus}
+      className="ml-9 flex gap-[10px]"
+    >
+      <div className="w-0.5 shrink-0 rounded-sm bg-border" aria-hidden />
+      <div className="min-w-0 flex-1">
+      <button
+        type="button"
+        onClick={isLocked ? undefined : () => onToggle(item.capsule_id)}
+        disabled={isLocked}
+        className={`flex items-center gap-2 w-full text-left font-mono text-[11px] text-secondary ${isLocked ? 'cursor-default' : 'cursor-pointer hover:text-primary'}`}
+      >
+        <Chevron size={13} className="shrink-0" />
+        {derivedStatus === 'running' && (
+          <Loader2 size={12} className="shrink-0 animate-spin" />
+        )}
+        <span className="truncate text-primary font-medium">{summary}</span>
+      </button>
+      {isExpanded && item.items.length > 0 && (
+        <div className="mt-2 pt-2 border-t border-border/30">
+          {item.items.map((child, ci) => {
+            if (child.type === 'reasoning_block') {
+              return (
+                <div
+                  key={`rc-r-${ci}`}
+                  className="mb-2 pl-3 border-l-2 border-accent/40 italic text-secondary text-[13px] leading-relaxed whitespace-pre-wrap"
+                >
+                  {child.content}
+                </div>
+              );
+            }
+            if (child.type === 'tool_call_row') {
+              return (
+                <ToolCallRow
+                  key={`rc-t-${ci}-${child.tool_call_id}`}
+                  row={child}
+                />
+              );
+            }
+            if (child.type === 'agent_message') {
+              // Empty-content marker delimits silent tool batches.
+              return (
+                <div
+                  key={`rc-m-${ci}`}
+                  className="my-2 border-t border-border/40"
+                  aria-hidden
+                />
+              );
+            }
+            return null;
+          })}
+        </div>
+      )}
+      </div>
+    </div>
+  );
+});
+
 // A live tool_result event, as far as the capsule row needs it. Newer
 // daemons send the tool_call_id plus the part of the result the row shows
 // (activity_translator.py `_result_preview`); older ones send neither — only
@@ -353,8 +510,9 @@ function markLatestLiveCallResultReceived(
   prev: DisplayItem[],
   timestamp: string,
   result: LiveToolResult = { content: '' },
+  owner?: string,
 ): DisplayItem[] {
-  const live = getLiveRunningCapsule(prev);
+  const live = getLiveRunningCapsule(prev, owner);
   if (!live) return prev;
   const items = live.capsule.items;
   // Pair by id when the daemon sends one: parallel calls finish in any
@@ -388,6 +546,57 @@ function markLatestLiveCallResultReceived(
     }
   }
   return prev;
+}
+
+/** Spec 100: a sub-agent's live tool result. Pairs by id with the row in
+ * the worker's most recent capsule holding it — not only a running tail
+ * capsule: the worker's own text bubble may have closed that capsule
+ * between the call and its result. */
+export function markWorkerResult(
+  prev: DisplayItem[],
+  owner: string,
+  timestamp: string,
+  result: LiveToolResult,
+): DisplayItem[] {
+  if (!result.toolCallId) {
+    return markLatestLiveCallResultReceived(prev, timestamp, result, owner);
+  }
+  for (let i = prev.length - 1; i >= 0; i--) {
+    const item = prev[i];
+    if (item.type !== 'agent_run' || item.source !== owner) continue;
+    const k = item.items.findIndex(
+      (c) => c.type === 'tool_call_row' && c.tool_call_id === result.toolCallId,
+    );
+    if (k < 0) continue;
+    const row = item.items[k] as ToolCallRowItem;
+    const newItems = [...item.items];
+    newItems[k] = {
+      ...row,
+      result_content: result.content,
+      result_status: 'received',
+      ...(result.totals ? { result_totals: result.totals } : {}),
+    };
+    const next = [...prev];
+    next[i] = {
+      ...item,
+      items: newItems,
+      ...(item.status === 'running' ? { ended_at: Date.parse(timestamp) } : {}),
+    };
+    return next;
+  }
+  return prev;
+}
+
+// Spec 100: worker thinking reaches the pane at most once per frame.
+function requestFrame(fn: () => void): number {
+  return typeof requestAnimationFrame === 'function'
+    ? requestAnimationFrame(fn)
+    : window.setTimeout(fn, 16);
+}
+
+function cancelFrame(id: number): void {
+  if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(id);
+  else window.clearTimeout(id);
 }
 
 // FE-1/FE-3: the legacy `reconcileTrailingRunning` sweep is gone. With the
@@ -557,6 +766,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   // The WS effect's handler closures don't re-subscribe on locale change —
   // read the live locale through a ref (same staleness fix as sessionIdRef).
   const localeRef = useRef(locale);
+  // Spec 100: worker thinking waiting for the next frame, per worker handle.
+  const workerReasoningRef = useRef(new Map<string, string>());
+  const workerFrameRef = useRef<number | null>(null);
   useEffect(() => { localeRef.current = locale; }, [locale]);
   // One live sub-agent status pipeline for this session (spec 099): the
   // status bar's chips and the pin control's running dot both read it.
@@ -610,6 +822,14 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   const [stream, setStream] = useState<StreamState | null>(null);
   const [approvals, setApprovals] = useState<Map<string, PendingApproval>>(new Map());
   const [expandedCapsules, setExpandedCapsules] = useState<Set<string>>(new Set());
+  const toggleCapsule = useCallback((capsuleId: string) => {
+    setExpandedCapsules((prev) => {
+      const next = new Set(prev);
+      if (next.has(capsuleId)) next.delete(capsuleId);
+      else next.add(capsuleId);
+      return next;
+    });
+  }, []);
   // Seeded from initialDraft (Workbench prefill doorway) so it's visible on
   // the very first paint — useState's initializer runs once, at mount, so
   // this cannot re-apply on a later re-render with a changed prop.
@@ -1789,11 +2009,48 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     // history being shown (see §5 of the T5 brief). The user's own typed
     // message (handleUserMessage nonce path) is the one exception — it always
     // renders optimistically for the session it was sent into.
+    // Spec 100: a sub-agent's thinking, buffered per worker and applied at
+    // most once per frame (one setItems for everything that arrived). The
+    // buffer is read and cleared here, outside the updater.
+    function flushWorkerReasoning() {
+      if (workerFrameRef.current !== null) {
+        cancelFrame(workerFrameRef.current);
+        workerFrameRef.current = null;
+      }
+      const pending = workerReasoningRef.current;
+      if (pending.size === 0) return;
+      const entries = [...pending];
+      pending.clear();
+      const ts = new Date().toISOString();
+      setItems((prev) =>
+        entries.reduce((acc, [owner, text]) => appendLiveReasoning(acc, text, ts, owner, owner), prev),
+      );
+      scrollToBottom();
+    }
+
+    function queueWorkerReasoning(owner: string, text: string) {
+      const pending = workerReasoningRef.current;
+      pending.set(owner, (pending.get(owner) ?? '') + text);
+      if (workerFrameRef.current === null) {
+        workerFrameRef.current = requestFrame(flushWorkerReasoning);
+      }
+    }
+
     function handleStreamDelta(event: WebSocketEvent) {
       const e = event as StreamDeltaEvent;
       if (e.project_id !== projectId) return;
       // Strict session routing: render only deltas for the viewed session.
       if (!e.session_id || e.session_id !== sessionIdRef.current) return;
+
+      // Spec 100: a sub-agent's thinking goes into its own capsule. It is not
+      // the manager's stream: no thinking indicator, no running latch.
+      if (e.worker) {
+        const reasoning = e.reasoning_content ?? '';
+        if (reasoning && e.source && e.source !== 'management' && !isWorkerHandle(e.source)) {
+          queueWorkerReasoning(e.source, reasoning);
+        }
+        return;
+      }
 
       // A live delta for the VIEWED session is definitive proof it is the
       // session actively executing. Latch the "was running while viewed" flag
@@ -1873,6 +2130,49 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
       // project-scoped activity with no session_id, e.g. network_blocked, is
       // dropped rather than risk leaking into every session.)
       if (!e.session_id || e.session_id !== sessionIdRef.current) return;
+
+      // Spec 100: a sub-agent's live tool call or result, into its own
+      // capsule (anchored under its header). Fanout workers stay out of the
+      // main chat (spec 009 §0.5-8), as their bubbles do.
+      if (e.worker_event) {
+        const owner = e.source;
+        if (!owner || owner === 'management' || isWorkerHandle(owner)) return;
+        flushWorkerReasoning(); // thinking that arrived first renders first
+        if (e.worker_event === 'tool_result') {
+          const totals =
+            e.result_total_chars !== undefined && e.result_total_lines !== undefined
+              ? { chars: e.result_total_chars, lines: e.result_total_lines }
+              : undefined;
+          setItems((prev) =>
+            markWorkerResult(prev, owner, e.timestamp, {
+              toolCallId: e.tool_call_id || undefined,
+              content: e.result_preview ?? '',
+              totals,
+            }),
+          );
+        } else {
+          const toolName = e.tool_name || 'tool';
+          setItems((prev) =>
+            upsertWorkerToolRow(prev, owner, {
+              type: 'tool_call_row',
+              tool_name: toolName,
+              target_description: describeWorkerTool(
+                toolName,
+                e.arguments,
+                project.workspace,
+                (k, v) => translate(localeRef.current, k, v),
+              ),
+              tool_call_id: e.tool_call_id || e.id,
+              category: workerToolCategory(toolName),
+              timestamp: e.timestamp,
+              result_content: null,
+              result_status: 'pending',
+            }),
+          );
+        }
+        scrollToBottom();
+        return;
+      }
 
       // agent_output activities duplicate sub-agent messages already
       // delivered via chat.sub_agent_message — drop them.
@@ -2013,8 +2313,11 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
       const cleaned = (e.content ?? '').replace(/\x1b\[[0-9;]*m/g, '').trim();
       if (!cleaned || cleaned === '(no response)') return;
 
+      flushWorkerReasoning();
       setItems((prev) => [
-        ...prev,
+        // Spec 100: the worker's text closes its live capsule, as the
+        // manager's visible text closes its own.
+        ...finalizeLiveCapsule(prev, 'completed', e.source),
         {
           type: 'sub_agent_message',
           content: cleaned,
@@ -2369,6 +2672,13 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
     on('fanout.completed', handleFanoutCompleted);
 
     return () => {
+      // Buffered worker thinking belongs to the view being torn down; the
+      // transcript still has it for the next load.
+      if (workerFrameRef.current !== null) {
+        cancelFrame(workerFrameRef.current);
+        workerFrameRef.current = null;
+      }
+      workerReasoningRef.current.clear();
       off('chat.stream_delta', handleStreamDelta);
       off('agent.activity', handleActivity);
       off('approval.request', handleApprovalRequest);
@@ -3167,9 +3477,9 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
             let rendered: React.ReactNode = null;
 
             if (item.type === 'user_message') {
-              rendered = <ChatMessage key={`msg-${index}`} message={item} workspace={project.workspace} onOpenPath={onOpenPath} />;
+              rendered = <MemoChatMessage key={`msg-${index}`} message={item} workspace={project.workspace} onOpenPath={onOpenPath} />;
             } else if (item.type === 'agent_message' || item.type === 'sub_agent_message') {
-              rendered = <ChatMessage key={`msg-${index}`} message={item} agentName={project.agent_name} workspace={project.workspace} onOpenPath={onOpenPath} />;
+              rendered = <MemoChatMessage key={`msg-${index}`} message={item} agentName={project.agent_name} workspace={project.workspace} onOpenPath={onOpenPath} />;
             } else if (item.type === 'sub_agent_activity') {
               // FE-A2: compact one-line marker for [Sub-agent] lifecycle.
               // 'error' (backlog #23 D2 — the "stopped with error:" marker)
@@ -3327,79 +3637,14 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
               const isExpanded =
                 derivedStatus === 'running' ||
                 expandedCapsules.has(item.capsule_id);
-              const isLocked = derivedStatus === 'running';
-              const summary = capsuleSummaryText({ ...item, status: derivedStatus }, t);
-              const Chevron = isExpanded ? ChevronDown : ChevronRight;
               rendered = (
-                <div
+                <AgentRunCapsule
                   key={`run-${item.capsule_id}`}
-                  data-testid="agent_run"
-                  data-capsule-id={item.capsule_id}
-                  data-capsule-status={derivedStatus}
-                  className="ml-9 flex gap-[10px]"
-                >
-                  <div className="w-0.5 shrink-0 rounded-sm bg-border" aria-hidden />
-                  <div className="min-w-0 flex-1">
-                  <button
-                    type="button"
-                    onClick={
-                      isLocked
-                        ? undefined
-                        : () => {
-                            setExpandedCapsules((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(item.capsule_id)) next.delete(item.capsule_id);
-                              else next.add(item.capsule_id);
-                              return next;
-                            });
-                          }
-                    }
-                    disabled={isLocked}
-                    className={`flex items-center gap-2 w-full text-left font-mono text-[11px] text-secondary ${isLocked ? 'cursor-default' : 'cursor-pointer hover:text-primary'}`}
-                  >
-                    <Chevron size={13} className="shrink-0" />
-                    {derivedStatus === 'running' && (
-                      <Loader2 size={12} className="shrink-0 animate-spin" />
-                    )}
-                    <span className="truncate text-primary font-medium">{summary}</span>
-                  </button>
-                  {isExpanded && item.items.length > 0 && (
-                    <div className="mt-2 pt-2 border-t border-border/30">
-                      {item.items.map((child, ci) => {
-                        if (child.type === 'reasoning_block') {
-                          return (
-                            <div
-                              key={`rc-r-${ci}`}
-                              className="mb-2 pl-3 border-l-2 border-accent/40 italic text-secondary text-[13px] leading-relaxed whitespace-pre-wrap"
-                            >
-                              {child.content}
-                            </div>
-                          );
-                        }
-                        if (child.type === 'tool_call_row') {
-                          return (
-                            <ToolCallRow
-                              key={`rc-t-${ci}-${child.tool_call_id}`}
-                              row={child}
-                            />
-                          );
-                        }
-                        if (child.type === 'agent_message') {
-                          // Empty-content marker delimits silent tool batches.
-                          return (
-                            <div
-                              key={`rc-m-${ci}`}
-                              className="my-2 border-t border-border/40"
-                              aria-hidden
-                            />
-                          );
-                        }
-                        return null;
-                      })}
-                    </div>
-                  )}
-                  </div>
-                </div>
+                  item={item}
+                  derivedStatus={derivedStatus}
+                  isExpanded={isExpanded}
+                  onToggle={toggleCapsule}
+                />
               );
             } else if (item.type === 'agent_notify') {
               const urgencyColor = item.urgency === 'high' ? 'border-error/40 bg-error/5' : 'border-accent/30 bg-accent/5';

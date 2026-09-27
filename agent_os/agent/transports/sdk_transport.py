@@ -25,7 +25,10 @@ try:
         ResultMessage,
         SystemMessage,
         TextBlock,
+        ThinkingBlock,
+        ToolResultBlock,
         ToolUseBlock,
+        UserMessage,
     )
     HAS_SDK = True
 except ImportError:
@@ -653,6 +656,31 @@ class SDKTransport(AgentTransport):
                         },
                         raw_text=f"[Using tool: {block.name}]",
                     ))
+                elif isinstance(block, ThinkingBlock):
+                    # Spec 100: display-only. Most blocks arrive with empty
+                    # text (the model omits it), and an empty row is noise.
+                    text = block.thinking or ""
+                    if text.strip():
+                        events.append(TransportEvent(
+                            event_type="thinking",
+                            data={"text": text},
+                            raw_text=text,
+                        ))
+
+        elif isinstance(msg, UserMessage):
+            # Spec 100: tool results come back as a user turn. Paired with
+            # their tool_use by id; display-only (never the turn's summary).
+            if isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, ToolResultBlock):
+                        events.append(TransportEvent(
+                            event_type="tool_result",
+                            data={
+                                "tool_call_id": block.tool_use_id,
+                                "content": _tool_result_text(block.content),
+                                "is_error": bool(block.is_error),
+                            },
+                        ))
 
         elif isinstance(msg, ResultMessage):
             self._session_id = getattr(msg, 'session_id', None)
@@ -782,3 +810,15 @@ class SDKTransport(AgentTransport):
             logger.warning(
                 "SDKTransport: sub-agent usage capture failed (session=%s); "
                 "continuing without it.", self._session_id, exc_info=True)
+
+
+def _tool_result_text(content) -> str:
+    """A ToolResultBlock's content as text: a string as-is, the text parts of
+    a content list joined, anything else (images, None) as empty."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text", "")) for part in content
+            if isinstance(part, dict) and part.get("type") == "text")
+    return ""

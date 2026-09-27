@@ -11,7 +11,7 @@ from typing import AsyncIterator
 @dataclass
 class TransportEvent:
     """Structured event from a transport."""
-    event_type: str  # "message" | "tool_use" | "permission_request" | "status" | "error" | "session_created" | "turn_complete"
+    event_type: str  # "message" | "tool_use" | "tool_result" | "thinking" | "permission_request" | "status" | "error" | "session_created" | "turn_complete"
     data: dict = field(default_factory=dict)
     raw_text: str = ""
 
@@ -55,6 +55,11 @@ def transport_event_to_chunk(event: TransportEvent) -> "OutputChunk":
     type_map = {
         "message": "response",
         "tool_use": "tool_activity",
+        # Spec 100: a worker's tool results and non-empty thinking keep their
+        # own chunk types. Falling through to the "response" default would make
+        # them the turn's summary text and a chat.sub_agent_message bubble.
+        "tool_result": "tool_result",
+        "thinking": "thinking",
         "permission_request": "approval_request",
         # Provider reverse requests (questions/plans) block the current turn
         # and must reach ProcessManager as control-plane state, not fall

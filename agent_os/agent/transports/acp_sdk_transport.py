@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import uuid
@@ -500,9 +501,13 @@ class ACPSDKTransport(AgentTransport):
                 text,
             )
         if isinstance(update, AgentThoughtChunk):
+            # Spec 100: a streamed thought is display-only thinking. An empty
+            # chunk renders nothing, so it emits nothing.
             text = _content_text(update.content)
-            return TransportEvent("status", {"text": text, "kind": "thought"}, text)
-        if isinstance(update, (ToolCallStart, ToolCallProgress)):
+            if not text:
+                return None
+            return TransportEvent("thinking", {"text": text, "delta": True}, text)
+        if isinstance(update, ToolCallStart):
             return TransportEvent(
                 "tool_use",
                 {
@@ -513,12 +518,33 @@ class ACPSDKTransport(AgentTransport):
                     "update": dumped,
                 },
                 # The post-hoc capsule parser recovers tool names from this text
-                # and nothing else: transcript entries persist ``content`` with
-                # no metadata, so the format IS the contract
+                # when a row has no metadata (transcripts written before spec
+                # 100), so the format IS the contract
                 # (sub_agent_transcript.py:17-19). Plain titles produced zero
                 # capsule rows for every ACP agent, cursor included.
                 f"[Using tool: {update.title or update.kind or 'tool'}]",
             )
+        if isinstance(update, ToolCallProgress):
+            # Spec 100: a progress update belongs to the row its ToolCallStart
+            # opened (paired by tool_call_id), never a row of its own. So no
+            # ``[Using tool: X]`` text here: the legacy regex would count it
+            # as another call. Output or a terminal status is the row's result;
+            # anything else updates the row in place.
+            output = _tool_call_output(update)
+            data = {
+                "tool_call_id": update.tool_call_id,
+                "status": update.status,
+            }
+            if update.title or update.kind:
+                data["tool_name"] = update.title or update.kind
+            if update.raw_input is not None:
+                data["tool_input"] = update.raw_input
+            if output is not None or update.status in ("completed", "failed"):
+                data["content"] = output or ""
+                data["is_error"] = update.status == "failed"
+                return TransportEvent("tool_result", data, "")
+            data["update"] = dumped
+            return TransportEvent("tool_use", data, "")
         if isinstance(update, (AgentPlanUpdate, AgentPlanContentUpdate, AgentPlanRemovedUpdate)):
             return TransportEvent("status", {"kind": "plan", "plan": dumped}, "Plan updated")
         if isinstance(update, ConfigOptionUpdate):
@@ -853,6 +879,32 @@ class _ResumeUnsupported(Exception):
 
 def _content_text(content: Any) -> str:
     return content.text if isinstance(content, TextContentBlock) else ""
+
+
+def _tool_call_output(update: Any) -> str | None:
+    """A tool call update's output as text, or None when it carries none.
+
+    Text content blocks first, then a diff's path, then ``raw_output`` (a
+    string as-is; a structured value as compact JSON).
+    """
+    parts: list[str] = []
+    for item in getattr(update, "content", None) or []:
+        inner = getattr(item, "content", None)
+        if isinstance(inner, TextContentBlock):
+            parts.append(inner.text)
+        elif getattr(item, "type", None) == "diff":
+            parts.append(str(getattr(item, "path", "") or ""))
+    if parts:
+        return "\n".join(parts)
+    raw = getattr(update, "raw_output", None)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw
+    try:
+        return json.dumps(raw, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(raw)
 
 
 def _choose_permission_option(

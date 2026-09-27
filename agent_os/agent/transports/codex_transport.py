@@ -136,6 +136,9 @@ class CodexTransport(AgentTransport):
         # item["id"] intentionally (same identifier, two param names).
         self._message_parts: dict[str, str] = {}
         self._final_texts: list[str] = []          # message texts (send() return)
+        # Spec 100: reasoning items whose summary streamed as deltas, so the
+        # completed item does not repeat it whole.
+        self._reasoning_streamed: set[str] = set()
         self._turn_done: asyncio.Event | None = None
         # Display-only usage capture (P3-B). thread/tokenUsage/updated fires
         # repeatedly within a turn carrying the cumulative `total` and the
@@ -264,6 +267,26 @@ class CodexTransport(AgentTransport):
         if method in ("item/started", "item/completed"):
             await self._on_item(method, params.get("item") or {})
             return
+        if method == "item/reasoning/summaryTextDelta":
+            # Spec 100: reasoning summaries are display-only thinking. Sent
+            # only for some models/accounts; absence renders nothing.
+            delta = params.get("delta") or ""
+            if delta:
+                self._reasoning_streamed.add(params.get("itemId") or "")
+                await self._event_queue.put(TransportEvent(
+                    event_type="thinking",
+                    data={"text": delta, "delta": True}, raw_text=delta))
+            return
+        if method == "item/reasoning/summaryPartAdded":
+            # A new summary part is a paragraph break, once text has streamed.
+            if ((params.get("summaryIndex") or 0) > 0
+                    and (params.get("itemId") or "") in self._reasoning_streamed):
+                await self._event_queue.put(TransportEvent(
+                    event_type="thinking",
+                    data={"text": "\n\n", "delta": True}, raw_text="\n\n"))
+            return
+        if method == "item/reasoning/textDelta":
+            return  # raw reasoning text stays out (spec 100, out of scope)
         if method == "error":
             text = params.get("message") or json.dumps(params)[:500]
             await self._event_queue.put(TransportEvent(
@@ -427,19 +450,25 @@ class CodexTransport(AgentTransport):
         if itype == "commandExecution":
             command = item.get("command", "")
             started = phase == "item/started"
+            output = (item.get("aggregatedOutput") or "")[:2000]
+            data = {
+                "tool_name": "commandExecution",
+                "tool_id": item.get("id"),
+                # No run_in_background key — Codex has no surviving
+                # background work (FINDINGS A5c); the provenance
+                # registry stays inert for this transport by design.
+                "tool_input": {"command": command, "cwd": item.get("cwd")},
+                "status": item.get("status"),
+                "exit_code": item.get("exitCode"),
+                "aggregated_output": output,
+            }
+            if not started:
+                # Spec 100: the capsule row's result, in the shared key.
+                data["result"] = output
+                data["is_error"] = item.get("status") == "failed"
             await self._event_queue.put(TransportEvent(
                 event_type="tool_use",
-                data={
-                    "tool_name": "commandExecution",
-                    "tool_id": item.get("id"),
-                    # No run_in_background key — Codex has no surviving
-                    # background work (FINDINGS A5c); the provenance
-                    # registry stays inert for this transport by design.
-                    "tool_input": {"command": command, "cwd": item.get("cwd")},
-                    "status": item.get("status"),
-                    "exit_code": item.get("exitCode"),
-                    "aggregated_output": (item.get("aggregatedOutput") or "")[:2000],
-                },
+                data=data,
                 raw_text=(f"[Running command: {command}]" if started else
                           f"[Command finished (exit {item.get('exitCode')}): {command}]"),
             ))
@@ -448,18 +477,41 @@ class CodexTransport(AgentTransport):
             changes = item.get("changes") or []
             paths = ", ".join(c.get("path", "") for c in changes)
             verb = "Editing" if phase == "item/started" else "Edited"
+            data = {
+                "tool_name": "fileChange",
+                "tool_id": item.get("id"),
+                "tool_input": {"changes": changes},
+                "status": item.get("status"),
+            }
+            if phase == "item/completed":
+                # The row's result is the diff (FileUpdateChange.diff).
+                data["result"] = "\n".join(
+                    str(c.get("diff") or c.get("path") or "")
+                    for c in changes if isinstance(c, dict))
+                data["is_error"] = item.get("status") == "failed"
             await self._event_queue.put(TransportEvent(
                 event_type="tool_use",
-                data={
-                    "tool_name": "fileChange",
-                    "tool_id": item.get("id"),
-                    "tool_input": {"changes": changes},
-                    "status": item.get("status"),
-                },
+                data=data,
                 raw_text=f"[{verb} files: {paths}]",
             ))
             return
-        # userMessage echo, todoList, ... — no transcript value.
+        if itype == "reasoning":
+            item_id = item.get("id") or ""
+            if phase == "item/completed":
+                streamed = item_id in self._reasoning_streamed
+                self._reasoning_streamed.discard(item_id)
+                summary = [p for p in (item.get("summary") or [])
+                           if isinstance(p, str) and p.strip()]
+                if summary and not streamed:
+                    text = "\n\n".join(summary)
+                    await self._event_queue.put(TransportEvent(
+                        event_type="thinking", data={"text": text}, raw_text=text))
+            return
+        tool = _codex_tool_item(itype, item, completed=phase == "item/completed")
+        if tool is not None:
+            await self._event_queue.put(tool)
+            return
+        # userMessage echo, todoList, plan, ... — no transcript value.
 
     async def _put_message(self, text: str, phase_label: str | None = None) -> None:
         self._final_texts.append(text)
@@ -931,6 +983,101 @@ class CodexTransport(AgentTransport):
 # ----------------------------------------------------------------------
 # Short-lived quota probe (spec 099)
 # ----------------------------------------------------------------------
+
+def _codex_text_parts(items) -> str:
+    """Text of a codex/MCP content list: the ``text`` of each text-like part."""
+    if not isinstance(items, list):
+        return ""
+    parts = []
+    for part in items:
+        if isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+            elif part.get("type") in ("image", "inputImage"):
+                parts.append("[image]")
+    return "\n".join(parts)
+
+
+def _codex_tool_item(itype, item: dict, *, completed: bool) -> "TransportEvent | None":
+    """Spec 100: a codex tool-shaped ThreadItem as a ``tool_use`` event.
+
+    Covers the tool items besides commandExecution/fileChange. Keyed by the
+    item id, emitted on item/started and again (with ``result``) on
+    item/completed. The payloads are not a stable public contract (schema
+    pinned at codex-cli 0.144.5), so every field is read defensively: an
+    unknown type or a malformed item yields None — skip the row, never fail
+    the turn.
+    """
+    try:
+        result = None
+        is_error = False
+        if itype == "mcpToolCall":
+            server, tool = item.get("server") or "", item.get("tool") or "tool"
+            name = f"{server}.{tool}" if server else str(tool)
+            args = item.get("arguments")
+            if completed:
+                error = item.get("error")
+                if isinstance(error, dict) and error.get("message"):
+                    result, is_error = str(error["message"]), True
+                else:
+                    res = item.get("result")
+                    result = _codex_text_parts(
+                        res.get("content") if isinstance(res, dict) else None)
+        elif itype == "dynamicToolCall":
+            namespace, tool = item.get("namespace"), item.get("tool") or "tool"
+            name = f"{namespace}.{tool}" if namespace else str(tool)
+            args = item.get("arguments")
+            if completed:
+                result = _codex_text_parts(item.get("contentItems"))
+                is_error = item.get("success") is False
+        elif itype == "webSearch":
+            name = "webSearch"
+            args = {"query": item.get("query") or ""}
+            if isinstance(item.get("action"), dict):
+                args["action"] = item["action"]
+            if completed:
+                result = ""
+        elif itype == "imageView":
+            name = "imageView"
+            args = {"path": item.get("path") or ""}
+            if completed:
+                result = ""
+        elif itype == "imageGeneration":
+            # ``result`` is the image payload itself; never the row text.
+            name = "imageGeneration"
+            args = {"prompt": item.get("revisedPrompt") or ""}
+            if completed:
+                result = str(item.get("savedPath") or "")
+        elif itype == "collabAgentToolCall":
+            name = str(item.get("tool") or "collabAgent")
+            args = {"prompt": item.get("prompt") or "", "model": item.get("model")}
+            if completed:
+                result = ""
+        else:
+            return None
+        status = item.get("status")
+        if completed and status == "failed":
+            is_error = True
+        if not isinstance(args, dict):
+            args = {} if args is None else {"arguments": args}
+        data: dict = {
+            "tool_name": name,
+            "tool_id": item.get("id"),
+            "tool_input": args,
+            "status": status,
+        }
+        if completed:
+            data["result"] = result or ""
+            data["is_error"] = is_error
+            raw_text = f"[{name} {'failed' if is_error else 'finished'}]"
+        else:
+            raw_text = f"[Running {name}]"
+        return TransportEvent(event_type="tool_use", data=data, raw_text=raw_text)
+    except Exception:
+        logger.debug("CodexTransport: skipping malformed %s item", itype, exc_info=True)
+        return None
+
 
 async def fetch_codex_rate_limits(binary: str = "codex", *,
                                   timeout: float = 10.0) -> dict | None:
