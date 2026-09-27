@@ -2277,6 +2277,16 @@ class SubAgentManager:
             self._adapters.pop(sk, None)
         return result
 
+    def live_transports(self):
+        """Yield every live adapter's transport, across all projects and
+        sessions. Spec 099: a codex quota read reuses a live connection
+        instead of spawning a short-lived app-server."""
+        for adapters in list(self._adapters.values()):
+            for adapter in list(adapters.values()):
+                transport = getattr(adapter, "_transport", None)
+                if transport is not None and adapter.is_alive():
+                    yield transport
+
     def has_running_sub_agents(self, project_id: str) -> bool:
         """True iff a worker in ANY session of the project has an open turn.
 

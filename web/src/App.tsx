@@ -7,6 +7,7 @@ import { ArrowLeft } from 'lucide-react';
 import { usePlatform } from './hooks/usePlatform';
 import { useProjects } from './hooks/useProjects';
 import { useTriggers } from './hooks/useTriggers';
+import { applyQuotaUpdate, fetchAgentAvailability } from './hooks/useAgentAvailability';
 import { useWebSocket, type ConnectionState } from './hooks/useWebSocket';
 import { bumpPricingVersion } from './budget/pricingVersion';
 import UpdatePill from './components/UpdatePill';
@@ -200,11 +201,20 @@ export default function App() {
     return () => ws.off('sub_agent_install_done', bump);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // Spec 099: the same fetch fills the availability store (readiness +
+  // subscription quota) the pin menu reads; `agent.quota_updated` keeps the
+  // quota live between fetches.
+  useEffect(() => {
+    const onQuota = (e: WebSocketEvent) => {
+      if (e.type === 'agent.quota_updated') applyQuotaUpdate(e.agent, e.snapshot);
+    };
+    ws.on('agent.quota_updated', onQuota);
+    return () => ws.off('agent.quota_updated', onQuota);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   useEffect(() => {
     let cancelled = false;
-    api<Array<{ slug: string; name: string; installed: boolean }>>(
-      '/api/v2/agents/available',
-    )
+    fetchAgentAvailability()
       .then((agents) => {
         if (cancelled) return;
         setAgentsAvailable(

@@ -2935,6 +2935,48 @@ _available_cache: dict = {"result": None, "expires_at": 0.0}
 _AVAILABLE_CACHE_TTL = 60  # seconds
 
 
+def _live_codex_transport():
+    """A live codex handle's transport, if any (spec 099: its connection
+    answers ``account/rateLimits/read`` with no extra process)."""
+    if _sub_agent_manager is None or not hasattr(_sub_agent_manager,
+                                                 "live_transports"):
+        return None
+    from agent_os.agent.transports.codex_transport import CodexTransport
+    for transport in _sub_agent_manager.live_transports():
+        if isinstance(transport, CodexTransport):
+            return transport
+    return None
+
+
+def _codex_quota_reader(binary_path: str | None):
+    async def read():
+        live = _live_codex_transport()
+        if live is not None:
+            return await live.read_rate_limits()
+        from agent_os.agent.transports import codex_transport
+        return await codex_transport.fetch_codex_rate_limits(
+            binary_path or "codex")
+    return read
+
+
+def _with_quota(entries: list[dict]) -> list[dict]:
+    """Spec 099: overlay the current subscription quota (additive ``quota``,
+    absent for agents without a snapshot) and start a read-through codex
+    refresh when its snapshot is stale. Never waits on the read: a fresh
+    value arrives as ``agent.quota_updated``. Applied per request, so the
+    60 s status cache never serves an old quota."""
+    from agent_os.daemon_v2.quota_store import get_quota_store
+    store = get_quota_store()
+    if store is None:
+        return entries
+    for entry in entries:
+        if entry["slug"] == "codex" and entry.get("ready"):
+            store.ensure_codex_fresh(_codex_quota_reader(entry.get("binary_path")))
+    snapshots = store.snapshots()
+    return [{**e, "quota": snapshots[e["slug"]]} if e["slug"] in snapshots else e
+            for e in entries]
+
+
 @router.get("/agents/available")
 async def available_agents():
     """Return setup status for all registered agents."""
@@ -2943,7 +2985,7 @@ async def available_agents():
 
     now = time.time()
     if _available_cache["result"] is not None and now < _available_cache["expires_at"]:
-        return _available_cache["result"]
+        return _with_quota(_available_cache["result"])
 
     statuses = await asyncio.to_thread(_setup_engine.check_all)
     result = []
@@ -2968,7 +3010,7 @@ async def available_agents():
 
     _available_cache["result"] = result
     _available_cache["expires_at"] = time.time() + _AVAILABLE_CACHE_TTL
-    return result
+    return _with_quota(result)
 
 
 @router.get("/agents/{slug}/status")

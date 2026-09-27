@@ -235,6 +235,17 @@ def create_app(data_dir: str | None = None) -> FastAPI:
     async def _start_ws_drain():
         ws_manager._ensure_drain()
 
+    # 2b. Subscription quota (spec 099): one daemon-wide store the claude-code
+    # and codex transports feed directly, persisted in the data dir. Changes
+    # go to every client as ``agent.quota_updated`` — never a chat event.
+    from agent_os.daemon_v2 import quota_store
+    quota_store.install(quota_store.QuotaStore(
+        os.path.join(store_dir, "quota.json"),
+        on_change=lambda agent, snapshot: ws_manager.broadcast_global({
+            "type": "agent.quota_updated", "agent": agent,
+            "snapshot": snapshot}),
+    ))
+
     # 3. Activity translator
     activity_translator = ActivityTranslator(ws_manager)
 

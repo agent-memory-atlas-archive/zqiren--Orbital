@@ -32,6 +32,14 @@ except ImportError:
     HAS_SDK = False
 
 try:
+    # Spec 099: the CLI's per-turn subscription quota (claude-agent-sdk >=
+    # 0.1.58 parses ``rate_limit_event``). Same ``()`` sentinel as below so an
+    # older SDK degrades to "no quota" instead of failing the import.
+    from claude_agent_sdk.types import RateLimitEvent as _RateLimitEvent
+except ImportError:
+    _RateLimitEvent = ()
+
+try:
     # Background-task lifecycle messages (claude-agent-sdk >= ~0.1.5x). Used to
     # tell when an AWAITED background task is still running so the dispatch
     # consumer keeps reading until its continuation turn arrives. Imported
@@ -91,7 +99,7 @@ class SDKTransport(AgentTransport):
         # Event queue for streaming events (tool use, permission requests)
         self._event_queue: asyncio.Queue[TransportEvent] = asyncio.Queue()
         # Flush flag: set when receive_response() ends without a ResultMessage
-        # (e.g. due to unknown message type crash). Next send() drains stale
+        # (e.g. the stream raised mid-turn). Next send() drains stale
         # messages before issuing a new query.
         self._needs_flush: bool = False
         # Autonomy preset for filtering permission requests.
@@ -231,7 +239,9 @@ class SDKTransport(AgentTransport):
                     if event.event_type == "message":
                         response_parts.append(event.raw_text)
         except Exception as e:
-            # SDK may raise on unknown message types (e.g. rate_limit_event).
+            # The SDK can raise mid-stream (a transport failure, or a
+            # MessageParseError on a malformed frame; unknown message types
+            # are skipped, and rate_limit_event is parsed, since SDK 0.1.58).
             # If we already collected some response text, return it rather than failing.
             if response_parts:
                 logger.warning("SDKTransport.send: partial response due to: %s", e)
@@ -429,9 +439,9 @@ class SDKTransport(AgentTransport):
     async def _flush_stale_messages(self) -> None:
         """Drain leftover messages from the SDK buffer after a prior crash.
 
-        When receive_response() raises mid-stream (e.g. on an unknown message
-        type like rate_limit_event), the ResultMessage may still be sitting in
-        the SDK's internal channel. We consume it here so the next query()
+        When receive_response() raises mid-stream (e.g. a MessageParseError on
+        a malformed frame), the ResultMessage may still be sitting in the
+        SDK's internal channel. We consume it here so the next query()
         starts with a clean slate.
         """
         if self._client is None:
@@ -684,6 +694,14 @@ class SDKTransport(AgentTransport):
                     data={"session_id": sid, "model": self._last_model},
                     raw_text="",
                 ))
+
+        elif isinstance(msg, _RateLimitEvent):
+            # Spec 099: the account's subscription quota, sent on every turn.
+            # Straight to the quota store (display-only, never raises) and NO
+            # TransportEvent: an unmapped event type would default to a
+            # "response" chunk and land in the transcript and chat.
+            from agent_os.daemon_v2.quota_store import publish_claude_rate_limit
+            publish_claude_rate_limit(msg.rate_limit_info)
 
         return events
 

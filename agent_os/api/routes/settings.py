@@ -773,6 +773,15 @@ async def put_sub_agent_config(slug: str, req: SubAgentConfigRequest):
     return {"slug": slug, "config": cleaned}
 
 
+def _forget_quota(slug: str) -> None:
+    """Spec 099: drop the agent's persisted subscription quota after an
+    account change — the snapshot belongs to the old account."""
+    from agent_os.daemon_v2.quota_store import get_quota_store
+    store = get_quota_store()
+    if store is not None:
+        store.clear(slug)
+
+
 @router.post("/settings/sub-agents/refresh")
 async def refresh_sub_agent_status():
     """Invalidate the SetupEngine cache and return fresh status."""
@@ -969,6 +978,7 @@ async def _run_login_job(slug: str, job_id: str, command: str) -> None:
             })
         return
 
+    _forget_quota(slug)
     verified = await _credentials_now_configured(slug)
     _login_jobs[job_id]["status"] = "complete" if verified else "unverified"
     _login_jobs[job_id]["verified"] = verified
@@ -1070,6 +1080,7 @@ async def trigger_sub_agent_logout(slug: str):
 
     if _setup_engine is not None and hasattr(_setup_engine, "invalidate_cache"):
         _setup_engine.invalidate_cache()
+    _forget_quota(slug)
 
     return {
         "slug": slug,
@@ -1172,6 +1183,7 @@ async def set_sub_agent_credential(slug: str, req: SubAgentCredentialRequest):
 
     if hasattr(_setup_engine, "invalidate_cache"):
         _setup_engine.invalidate_cache()
+    _forget_quota(slug)
 
     return {"slug": slug, "key": req.key, "set": True,
             "masked": _mask_secret(supplied)}
@@ -1186,6 +1198,7 @@ async def delete_sub_agent_credential(slug: str, key: str):
 
     if hasattr(_setup_engine, "invalidate_cache"):
         _setup_engine.invalidate_cache()
+    _forget_quota(slug)
 
     return {"slug": slug, "key": key, "set": False}
 
@@ -1252,6 +1265,7 @@ async def set_sub_agent_api_key(slug: str, req: SetSubAgentApiKeyRequest):
 
     if _setup_engine is not None and hasattr(_setup_engine, "invalidate_cache"):
         _setup_engine.invalidate_cache()
+    _forget_quota(slug)
 
     # The third way a key gets set, and the only one that emitted nothing.
     # Gated on the CLI accepting it: a rejected key never landed anywhere, so

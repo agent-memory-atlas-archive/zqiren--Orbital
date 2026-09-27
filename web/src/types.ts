@@ -569,6 +569,46 @@ export interface SubAgentLifecycleEvent {
   background_terminated?: string[];
 }
 
+/** Spec 099 — one subscription rate-limit window. `used_pct` is 0..100;
+ *  `resets_at` is ISO-8601, null when the source did not say. */
+export type QuotaWindowKind = 'five_hour' | 'weekly' | 'weekly_opus' | 'weekly_sonnet';
+
+export interface QuotaWindow {
+  kind: QuotaWindowKind;
+  used_pct: number;
+  resets_at: string | null;
+}
+
+/** Spec 099 — the account-wide subscription quota for claude-code / codex,
+ *  as the daemon last observed it (`observed_at`). */
+export interface QuotaSnapshot {
+  agent: string;
+  observed_at: string;
+  plan: string | null;
+  limited: boolean;
+  windows: QuotaWindow[];
+}
+
+/** One entry of GET /api/v2/agents/available. Everything past slug/name is
+ *  optional: an older backend (dev Vite proxying the packaged app) may omit
+ *  fields, and a missing `quota` means "no usage info", never "fine". */
+export interface AgentAvailability {
+  slug: string;
+  name: string;
+  installed?: boolean;
+  ready?: boolean;
+  missing_credentials?: string[];
+  quota?: QuotaSnapshot;
+}
+
+/** Spec 099 — the daemon's quota store changed (null = cleared). Global:
+ *  sent to every client, never tied to a project or a chat. */
+export interface QuotaUpdatedEvent {
+  type: 'agent.quota_updated';
+  agent: string;
+  snapshot: QuotaSnapshot | null;
+}
+
 /** Sub-agent status as reported by GET /agents/{id}/sub-agents/status.
  * 'background-running' = turn done but tracked background work is alive
  * (SDK claude-code only; other transports report two-state). */
@@ -993,6 +1033,7 @@ export type WebSocketEvent =
   | LoginProgressEvent
   | LoginCompleteEvent
   | LoginFailedEvent
+  | QuotaUpdatedEvent
   | UpdateAvailableEvent;
 
 // Queue resource types (mirror agent_os/queue/models.py)

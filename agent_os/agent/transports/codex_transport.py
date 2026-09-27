@@ -148,6 +148,8 @@ class CodexTransport(AgentTransport):
         # enforcement). Keyed by (threadId, turnId) so a resumed/late
         # notification for a finished turn can't double-emit.
         self._codex_last_usage: dict[tuple[str, str], dict] = {}
+        # Spec 099: strong ref to the post-start quota read.
+        self._rate_limit_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # turn bookkeeping
@@ -274,9 +276,15 @@ class CodexTransport(AgentTransport):
             # boundary (turn/completed). This notification NEVER drives idle.
             self._track_token_usage(params)
             return
-        # thread/started, thread/status/changed, account/rateLimits/updated,
-        # mcpServer/* — supplementary only. NEVER drives idle (TEST RULE 1)
-        # and not worth a transcript row.
+        if method == "account/rateLimits/updated":
+            # Spec 099: a sparse rolling quota update, merged into the quota
+            # store. Display-only: no event, NEVER drives idle, no transcript
+            # row.
+            from agent_os.daemon_v2.quota_store import publish_codex_snapshot
+            publish_codex_snapshot(params.get("rateLimits"), push=True)
+            return
+        # thread/started, thread/status/changed, mcpServer/* — supplementary
+        # only. NEVER drives idle (TEST RULE 1) and not worth a transcript row.
         logger.debug("CodexTransport: ignoring notification %s", method)
 
     def _track_token_usage(self, params: dict) -> None:
@@ -487,6 +495,29 @@ class CodexTransport(AgentTransport):
             raise RuntimeError(f"codex {method} failed: {msg['error']}")
         return msg.get("result") or {}
 
+    async def read_rate_limits(self, timeout: float = 10.0) -> dict | None:
+        """``account/rateLimits/read`` over this live connection (spec 099).
+
+        No thread or turn needed; answers immediately. None when the
+        transport is down; raises on an RPC error or timeout (the quota
+        store's bounded reader maps both to "no fresh value")."""
+        if not self._alive:
+            return None
+        return await self._request("account/rateLimits/read", None,
+                                   timeout=timeout)
+
+    async def _publish_rate_limits(self) -> None:
+        from agent_os.daemon_v2.quota_store import (
+            pick_codex_snapshot,
+            publish_codex_snapshot,
+        )
+        try:
+            result = await self.read_rate_limits()
+        except Exception as exc:  # noqa: BLE001 — display data only
+            logger.info("CodexTransport: rate-limit read failed (%s)", exc)
+            return
+        publish_codex_snapshot(pick_codex_snapshot(result))
+
     async def _notify(self, method: str, params: dict | None = None) -> None:
         msg: dict = {"jsonrpc": "2.0", "method": method}
         if params is not None:
@@ -617,6 +648,10 @@ class CodexTransport(AgentTransport):
             "name": "orbital", "title": "Orbital", "version": "0.1.0"}})
         self._check_version(init)
         await self._notify("initialized")
+        # Spec 099: one quota read per handle start, in the background so a
+        # slow answer never delays the thread open.
+        self._rate_limit_task = asyncio.create_task(
+            self._publish_rate_limits(), name=f"codex-ratelimits-{id(self)}")
 
         if self._model is None and not self._resume_session_id:
             # Never open a FRESH thread on the unqualified server default
@@ -891,3 +926,74 @@ class CodexTransport(AgentTransport):
         pattern = os.path.join(home, "sessions", "*", "*", "*",
                                f"rollout-*-{thread_id}.jsonl")
         return bool(_glob.glob(pattern))
+
+
+# ----------------------------------------------------------------------
+# Short-lived quota probe (spec 099)
+# ----------------------------------------------------------------------
+
+async def fetch_codex_rate_limits(binary: str = "codex", *,
+                                  timeout: float = 10.0) -> dict | None:
+    """Spawn ``<binary> app-server`` just long enough to answer
+    ``account/rateLimits/read`` (initialize → initialized → read → kill).
+
+    For when no live codex handle exists. Async, bounded by ``timeout`` in
+    total, and never raises: any failure (binary missing, not logged in,
+    protocol drift, timeout) returns None. Same handshake as
+    ``codex_models.read_model_ids``.
+    """
+    proc = None
+
+    async def exchange() -> dict:
+        def send(obj: dict) -> None:
+            proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+
+        async def read_response(rpc_id: int) -> dict:
+            while True:
+                line = await read_jsonl_line(proc.stdout)
+                if not line:
+                    raise RuntimeError(
+                        "codex app-server closed the stream before responding")
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(msg, dict) and msg.get("id") == rpc_id:
+                    if "error" in msg:
+                        raise RuntimeError(f"codex error: {msg['error']}")
+                    return msg.get("result") or {}
+
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"clientInfo": {
+                  "name": "orbital", "title": "Orbital", "version": "0.1.0"}}})
+        await proc.stdin.drain()
+        await read_response(1)
+        send({"jsonrpc": "2.0", "method": "initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read"})
+        await proc.stdin.drain()
+        return await read_response(2)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            binary, "app-server",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            limit=1024 * 1024,
+            creationflags=win_no_window_flags(),
+        )
+        return await asyncio.wait_for(exchange(), timeout)
+    except Exception as exc:  # noqa: BLE001 — display data, never raise
+        logger.info("codex rate-limit probe unavailable (%s: %s)",
+                    type(exc).__name__, exc)
+        return None
+    finally:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), 2.0)
+            except Exception:  # noqa: BLE001
+                pass

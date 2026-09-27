@@ -21,7 +21,7 @@ dependencies = [
     "aiofiles>=23.0",
     "watchdog>=3.0",
     "pyyaml>=6.0",
-    "claude-agent-sdk>=0.1.48",
+    "claude-agent-sdk>=0.1.58",
     "agent-client-protocol==0.11.0",
     # Capped below 2.0: mcp 2.0.0 (released 2026-08-19) drops
     # `streamablehttp_client` from mcp.client.streamable_http, which

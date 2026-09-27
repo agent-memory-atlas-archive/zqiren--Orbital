@@ -458,6 +458,7 @@ import SlotHeldNotice from './SlotHeldNotice';
 import PendingInputNotice from './PendingInputNotice';
 import { ColdStartCard } from './ColdStartCard';
 import SubAgentStatusBar from './SubAgentStatusBar';
+import { useSubAgentStatus } from '../hooks/useSubAgentStatus';
 import FanoutCard, { isTerminal, type FanoutTaskState } from './FanoutCard';
 import SubAgentDrillIn from './SubAgentDrillIn';
 
@@ -557,6 +558,13 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
   // read the live locale through a ref (same staleness fix as sessionIdRef).
   const localeRef = useRef(locale);
   useEffect(() => { localeRef.current = locale; }, [locale]);
+  // One live sub-agent status pipeline for this session (spec 099): the
+  // status bar's chips and the pin control's running dot both read it.
+  const subAgentStatus = useSubAgentStatus(projectId, sessionId);
+  const runningSubAgents = useMemo(
+    () => subAgentStatus.agents.filter((a) => a.status === 'running').map((a) => a.handle),
+    [subAgentStatus.agents],
+  );
   // Spec 002: open a clicked workspace path in the FilePreviewDrawer. Provided
   // by ProjectDetail (which owns setRoute); null when no provider is present.
   const onOpenPath = useContext(OpenPathContext) ?? undefined;
@@ -3039,7 +3047,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
         />
       )}
       {/* Piece 3 Part D: honest sub-agent status badge + user stop control */}
-      <SubAgentStatusBar projectId={projectId} sessionId={sessionId} />
+      <SubAgentStatusBar projectId={projectId} sessionId={sessionId} live={subAgentStatus} />
       {drillIn ? (
         <SubAgentDrillIn
           projectId={projectId}
@@ -3798,6 +3806,7 @@ export default function ChatView({ projectId, project, agentStatus, statusTick, 
             <PinTargetSelect
               agents={agents}
               value={pinnedTarget}
+              runningSlugs={runningSubAgents}
               onChange={(slug) => {
                 if (sessionId === undefined) return;
                 setLocalPin({ sessionId, slug });

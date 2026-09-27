@@ -345,7 +345,8 @@ describe('QueueComposer — agent picker', () => {
     );
 
     await user.click(picker.querySelector('button')!);
-    const menu = screen.getByRole('listbox');
+    // Spec 099: the listbox and its usage card share one positioned wrapper.
+    const menu = screen.getByRole('listbox').parentElement!;
     expect(menu.className).toContain('bottom-full');
     expect(menu.className).not.toContain('top-full');
   });

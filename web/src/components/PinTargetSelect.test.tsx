@@ -17,12 +17,33 @@
  *    is no longer a one-message aside while pinned.
  */
 
-import { render, screen, cleanup, fireEvent } from '@testing-library/react';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen, cleanup, fireEvent, act } from '@testing-library/react';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+
+const apiMock = vi.hoisted(() => vi.fn());
+vi.mock('../config', () => ({ api: apiMock }));
 
 import PinTargetSelect, { resolveSendTarget } from './PinTargetSelect';
+import {
+  __resetAgentAvailability,
+  applyQuotaUpdate,
+  setAgentAvailability,
+} from '../hooks/useAgentAvailability';
+import { LocaleProvider } from '../i18n/LocaleContext';
+import type { AgentAvailability, QuotaSnapshot } from '../types';
 
-afterEach(() => cleanup());
+beforeEach(() => {
+  apiMock.mockReset();
+  // Menu open re-fetches availability; by default the daemon is unreachable,
+  // which must leave the loaded state alone.
+  apiMock.mockRejectedValue(new Error('offline'));
+});
+
+afterEach(() => {
+  cleanup();
+  act(() => __resetAgentAvailability());
+  vi.useRealTimers();
+});
 
 const AGENTS = [
   { slug: 'claude-code', name: 'Claude Code' },
@@ -95,8 +116,10 @@ describe('PinTargetSelect', () => {
     expect(screen.queryByRole('listbox')).toBeNull();
     fireEvent.click(trigger());
     const options = screen.getAllByRole('option');
+    // Spec 099 mockup: "Manager" and a check column on every row. With no
+    // availability loaded there is no usage text at all (unknown ≠ fine).
     expect(options.map((o) => o.textContent)).toEqual([
-      'Orbitalmanager', 'Claude Code', 'Codex',
+      'OrbitalManager✓', 'Claude Code', 'Codex',
     ]);
   });
 
@@ -142,5 +165,193 @@ describe('PinTargetSelect', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(screen.queryByRole('listbox')).toBeNull();
     expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Spec 099 — availability dot, usage line, hover card
+// ---------------------------------------------------------------------------
+
+describe('PinTargetSelect — usage + availability (spec 099)', () => {
+  const NOW = new Date('2026-09-27T19:00:00');
+  const inH = (h: number) => new Date(NOW.getTime() + h * 3600_000).toISOString();
+  const ago = (m: number) => new Date(NOW.getTime() - m * 60_000).toISOString();
+
+  const quota = (agent: string, five: number, week: number,
+    extra: Partial<QuotaSnapshot> = {}): QuotaSnapshot => ({
+    agent, observed_at: ago(4), plan: null, limited: false,
+    windows: [
+      { kind: 'five_hour', used_pct: 100 - five, resets_at: inH(3) },
+      { kind: 'weekly', used_pct: 100 - week, resets_at: inH(24 * 2 + 22) },
+    ],
+    ...extra,
+  });
+
+  const FOUR: AgentAvailability[] = [
+    { slug: 'claude-code', name: 'Claude Code', installed: true, ready: true,
+      quota: quota('claude-code', 21, 92) },
+    { slug: 'codex', name: 'Codex', installed: true, ready: true,
+      quota: quota('codex', 82, 97, { plan: 'plus', observed_at: ago(0) }) },
+    { slug: 'cursor', name: 'Cursor', installed: true, ready: true },
+    { slug: 'pi', name: 'Pi', installed: true, ready: false,
+      missing_credentials: ['pi_auth'] },
+  ];
+  const ROWS = FOUR.map(({ slug, name }) => ({ slug, name }));
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+  });
+
+  const trigger = () =>
+    screen.getByRole('button', { name: 'Choose who this chat talks to' });
+  const open = () => fireEvent.click(trigger());
+  const line = (slug: string) => screen.getByTestId(`pin-quota-${slug}`);
+  const dot = (slug: string) => screen.queryByTestId(`pin-dot-${slug}`);
+
+  it('rows show what is left of the shown window, and no dot when healthy', () => {
+    act(() => setAgentAvailability(FOUR));
+    render(<PinTargetSelect agents={ROWS} value="claude-code" onChange={() => {}} />);
+    open();
+    expect(line('claude-code').textContent).toBe('5h · 21% left');
+    expect(line('codex').textContent).toBe('5h · 82% left');
+    expect(dot('claude-code')).toBeNull();
+    expect(dot('codex')).toBeNull();
+    // Cursor exposes no usage and its existing probe carries no plan tier.
+    expect(screen.queryByTestId('pin-quota-cursor')).toBeNull();
+    expect(dot('cursor')).toBeNull();
+  });
+
+  it('weekly replaces 5h when it is the tighter window', () => {
+    act(() => setAgentAvailability([{ ...FOUR[0], quota: quota('claude-code', 64, 9) }]));
+    render(<PinTargetSelect agents={ROWS.slice(0, 1)} value={null} onChange={() => {}} />);
+    open();
+    expect(line('claude-code').textContent).toBe('Week · 9% left');
+    expect(line('claude-code').dataset.tone).toBe('low');
+    expect(dot('claude-code')?.dataset.color).toBe('amber');
+  });
+
+  it('limit reached is red with the reset time', () => {
+    act(() => setAgentAvailability([{ ...FOUR[0],
+      quota: quota('claude-code', 0, 71, { limited: true }) }]));
+    render(<PinTargetSelect agents={ROWS.slice(0, 1)} value={null} onChange={() => {}} />);
+    open();
+    expect(line('claude-code').textContent).toBe('Limit reached · 22:00');
+    expect(line('claude-code').dataset.tone).toBe('out');
+    expect(dot('claude-code')?.dataset.color).toBe('red');
+  });
+
+  it('claude-code with no snapshot says so; a not-ready agent gets the grey dot', () => {
+    act(() => setAgentAvailability([{ ...FOUR[0], quota: undefined }, FOUR[3]]));
+    render(<PinTargetSelect agents={[ROWS[0], ROWS[3]]} value={null} onChange={() => {}} />);
+    open();
+    expect(line('claude-code').textContent).toBe('No reading yet');
+    expect(line('pi').textContent).toBe('Needs login');
+    expect(dot('pi')?.dataset.color).toBe('grey');
+  });
+
+  it('the running worker pulses green', () => {
+    act(() => setAgentAvailability(FOUR));
+    render(<PinTargetSelect agents={ROWS} value="codex" onChange={() => {}}
+      runningSlugs={['codex']} />);
+    open();
+    expect(dot('codex')?.dataset.color).toBe('green');
+    expect(dot('codex')?.dataset.pulse).toBe('true');
+  });
+
+  it('phone rows carry both windows, tighter first', () => {
+    act(() => setAgentAvailability([{ ...FOUR[0], quota: quota('claude-code', 64, 9) }]));
+    render(<PinTargetSelect agents={ROWS.slice(0, 1)} value={null} onChange={() => {}} />);
+    open();
+    const stack = screen.getByTestId('pin-quota-stack-claude-code');
+    expect(Array.from(stack.children).map((c) => c.textContent))
+      .toEqual(['Week · 9% left', '5h · 64% left']);
+  });
+
+  it('collapsed control: no dot when healthy, a corner dot when it needs attention', () => {
+    act(() => setAgentAvailability(FOUR));
+    const { rerender } = render(
+      <PinTargetSelect agents={ROWS} value="claude-code" onChange={() => {}} />);
+    expect(screen.queryByTestId('pin-control-dot')).toBeNull();
+    act(() => applyQuotaUpdate('claude-code', quota('claude-code', 12, 88)));
+    rerender(<PinTargetSelect agents={ROWS} value="claude-code" onChange={() => {}} />);
+    expect(screen.getByTestId('pin-control-dot').dataset.color).toBe('amber');
+    // Orbital (unpinned) never carries a dot.
+    rerender(<PinTargetSelect agents={ROWS} value={null} onChange={() => {}} />);
+    expect(screen.queryByTestId('pin-control-dot')).toBeNull();
+  });
+
+  it('the open menu shows the pinned worker\'s card; hovering a row switches it', () => {
+    act(() => setAgentAvailability(FOUR));
+    render(<PinTargetSelect agents={ROWS} value="claude-code" onChange={() => {}} />);
+    open();
+    const card = () => screen.getByTestId('pin-quota-card');
+    expect(card().textContent).toContain('Claude Code usage');
+    expect(card().textContent).toContain('5-hour window');
+    expect(card().textContent).toContain('21% left · resets 22:00 (in 3h)');
+    expect(card().textContent).toContain('Weekly');
+    expect(card().textContent).toContain('Updated 4 min ago, from its last reply');
+
+    fireEvent.mouseEnter(screen.getByRole('option', { name: /Codex/ }));
+    expect(card().textContent).toContain('Codex usage');
+    expect(card().textContent).toContain('Plus plan');
+    expect(card().textContent).toContain('Updated just now');
+
+    fireEvent.mouseEnter(screen.getByRole('option', { name: /Pi/ }));
+    expect(card().textContent).toContain('Pi is installed but not signed in');
+
+    fireEvent.mouseEnter(screen.getByRole('option', { name: /Orbital/ }));
+    expect(screen.queryByTestId('pin-quota-card')).toBeNull();
+  });
+
+  it('hovering the collapsed control shows the pinned worker\'s card', () => {
+    act(() => setAgentAvailability(FOUR));
+    render(<PinTargetSelect agents={ROWS} value="codex" onChange={() => {}} />);
+    expect(screen.queryByTestId('pin-quota-card')).toBeNull();
+    fireEvent.mouseEnter(trigger());
+    expect(screen.getByTestId('pin-quota-card').textContent).toContain('Codex usage');
+    fireEvent.mouseLeave(trigger());
+    expect(screen.queryByTestId('pin-quota-card')).toBeNull();
+  });
+
+  it('a window that reset since the reading shows no number', () => {
+    act(() => setAgentAvailability([{ ...FOUR[0], quota: {
+      ...quota('claude-code', 21, 92),
+      windows: [
+        { kind: 'five_hour', used_pct: 79, resets_at: inH(-1) },
+        { kind: 'weekly', used_pct: 8, resets_at: inH(-0.5) },
+      ] } }]));
+    render(<PinTargetSelect agents={ROWS.slice(0, 1)} value="claude-code" onChange={() => {}} />);
+    open();
+    expect(line('claude-code').textContent).toBe('No current reading');
+    expect(screen.getByTestId('pin-quota-card').textContent)
+      .toContain('Reset since the last reading');
+  });
+
+  it('opening the menu refreshes availability, and a newer quota lands live', async () => {
+    act(() => setAgentAvailability(FOUR));
+    apiMock.mockResolvedValue(FOUR.map((a) => a.slug === 'codex'
+      ? { ...a, quota: quota('codex', 40, 90, { plan: 'plus', observed_at: ago(0) }) } : a));
+    render(<PinTargetSelect agents={ROWS} value="codex" onChange={() => {}} />);
+    await act(async () => { open(); });
+    expect(apiMock).toHaveBeenCalledWith('/api/v2/agents/available');
+    expect(line('codex').textContent).toBe('5h · 40% left');
+  });
+
+  it('zh copy follows the mockup', () => {
+    localStorage.setItem('orbital.locale', 'zh');
+    try {
+      act(() => setAgentAvailability([{ ...FOUR[0], quota: quota('claude-code', 64, 9) }]));
+      render(
+        <LocaleProvider>
+          <PinTargetSelect agents={ROWS.slice(0, 1)} value={null} onChange={() => {}} />
+        </LocaleProvider>,
+      );
+      fireEvent.click(screen.getByRole('button'));
+      expect(line('claude-code').textContent).toBe('本周 · 剩余 9%');
+    } finally {
+      localStorage.removeItem('orbital.locale');
+    }
   });
 });
