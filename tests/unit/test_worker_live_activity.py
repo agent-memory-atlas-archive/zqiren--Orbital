@@ -147,7 +147,7 @@ async def _item(t, phase, item):
     await t._route_server_message({"jsonrpc": "2.0", "method": phase, "params": {"item": item}})
 
 
-# Field shapes pinned to `codex app-server generate-json-schema` (0.144.5).
+# Field shapes pinned to `codex app-server generate-json-schema` (0.144.5; additive-only through 0.157.1).
 CODEX_ITEMS = {
     "mcpToolCall": (
         {"type": "mcpToolCall", "id": "m1", "server": "fs", "tool": "list",

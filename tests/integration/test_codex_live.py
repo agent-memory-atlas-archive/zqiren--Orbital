@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Orbital Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Codex live journeys (TEST RULE 2 + 5): real codex 0.144.5 app-server.
+"""Codex live journeys (TEST RULE 2 + 5): real codex 0.157.1 app-server.
 
 Covers: dispatch -> command + fileChange items -> final answer -> ONE honest
 turn boundary; on-request approval round-trip (decline continues / cancel
@@ -10,7 +10,7 @@ interrupts); kill -9 -> thread/resume -> context recalled; Stop leaves zero
 in-tree survivors.
 
 Heavy + costs live turns — opt-in: not in the default unit/platform run.
-Pinned to codex-cli 0.144.5; on a version bump re-run schema-gen + this file.
+Pinned to codex-cli 0.157.1; on a version bump re-run schema-gen + this file.
 """
 
 from __future__ import annotations
@@ -47,10 +47,14 @@ async def _events_until_turn_complete(transport, timeout=240.0):
 async def _cheapest_model(transport) -> str | None:
     result = await transport._request("model/list", {"includeHidden": False},
                                       timeout=30.0)
-    for m in result.get("data", []):
-        if "mini" in (m.get("id") or ""):
-            return m["id"]
-    return None
+    ids = [m.get("id") for m in result.get("data", []) if m.get("id")]
+    # Model churn: 0.157.1 accounts list no "-mini" (gpt-6-* / gpt-5.6-* /
+    # gpt-5.5). Prefer the small tiers by name, then any non-codex id.
+    for marker in ("mini", "luna", "nano"):
+        for model_id in ids:
+            if marker in model_id:
+                return model_id
+    return next((i for i in ids if "codex" not in i), None)
 
 
 async def _start(tmp_path, autonomy=Autonomy.HANDS_OFF, resume_record=None,

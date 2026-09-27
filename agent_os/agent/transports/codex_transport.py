@@ -48,7 +48,7 @@ from agent_os.utils.subprocess_flags import win_no_window_flags
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_CODEX_VERSION = "0.144.5"
+SUPPORTED_CODEX_VERSION = "0.157.1"
 
 # Autonomy preset -> (approvalPolicy, thread/start sandbox string enum).
 # FINDINGS A4a: `untrusted` is NOT "ask me everything" — it silently
