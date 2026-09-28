@@ -2,10 +2,10 @@
   <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-<p align="center"><strong>Claude Code hit its usage limit mid-task. Codex picked it up in the same conversation. Nothing was re-explained.</strong></p>
+<p align="center"><strong>Claude Code running out? Switch to Codex in the same conversation. Nothing re-explained.</strong></p>
 
-<!-- The clip is the Chinese-UI capture; an English re-shoot of the same scenario is pending -->
-<p align="center"><img src="docs/screenshots/handoff-codex-continue.gif" alt="In the same conversation Claude Code hits its usage limit; the user tells @codex to continue and Codex picks up from the same project context" width="100%"></p>
+<p align="center"><img src="docs/screenshots/in-session-agent-switch.png" alt="The agent picker in an Orbital chat: each agent shows how much of its usage window is left (Claude Code 67% of its week, Codex 84%), and switching to another agent continues the same conversation" width="100%"></p>
+<p align="center"><em>Every agent's remaining quota sits in the picker. Pick another one and it continues from the same project context.</em></p>
 
 <p align="center">
   <img src="docs/screenshots/orbital-logo.png" alt="Orbital" width="80">
@@ -15,19 +15,9 @@
 <p align="center"><strong>The project agent</strong></p>
 <h3 align="center">Every agent owns a session. Orbital owns the project.</h3>
 
-**Is your context actually yours?**
+<p align="center">Orbital keeps your project's context (state, decisions, lessons, output) as plain files in your local folder, so Claude Code, Codex, Cursor and Gemini CLI can take turns on the same project without you explaining it again. It can also do the work itself.</p>
 
-The plan it took three rounds with Claude Code to settle, the file Codex left half-edited, the trade-off you decided in Cursor: each one is locked inside its own session.
-
-Close the session, hit the usage limit, switch tools, and that context is out of reach. Next task, you explain it all again.
-
-**You are the agent's intern: copying and pasting, ferrying context, remembering where all the odd files live, while the agent gets the thinking.**
-
-Orbital takes the context out of the session and puts it back in your local folder. Any agent can pick it up at any time, with all of it intact. Claude Code, Codex and Cursor all work.
-
-**The context is yours. The intelligence is interchangeable.**
-
-<p align="center"><strong>Your context, usable by any agent</strong></p>
+<p align="center"><strong>The context is yours. The intelligence is interchangeable.</strong></p>
 
 <p align="center">
   <a href="https://github.com/zqiren/Orbital/releases/latest/download/Orbital-Setup.exe"><img src="https://img.shields.io/badge/Windows-Download_.exe-0078D6?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTMgNC42bDcuNi0xLjA1djcuMzVIM3ptOC41LTEuMkwyMSAyLjF2OC44aC05LjV6TTMgMTIuMWg3LjZ2Ny4zNUwzIDE4LjR6bTguNSAwSDIxdjguOGwtOS41LTEuM3oiLz48L3N2Zz4=" alt="Download the Windows installer (.exe)"></a>
@@ -42,17 +32,26 @@ https://github.com/user-attachments/assets/5f1373bc-2c3e-440b-af52-77ecbd80c27f
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](#license) ![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows) ![Platform: macOS](https://img.shields.io/badge/Platform-macOS-000000?logo=apple)
 
+
 ---
 
 ## Why a project agent?
 
+**Is your context actually yours?**
+
 You're three rounds into a design discussion with Claude Code when it stops with "You're out of usage credits." Your Codex quota is sitting right there, but Codex knows nothing about this project: the goal, the two decisions you just made, the half-edited files. You'd have to explain all of it again.
 
-People already use several capable agents at work — for the newest model, the leftover quota, or because a particular tool is better at the job.
+<!-- The clip is the Chinese-UI capture; an English re-shoot of the same scenario is pending -->
+<p align="center"><img src="docs/screenshots/handoff-codex-continue.gif" alt="In the same conversation Claude Code hits its usage limit; the user tells @codex to continue and Codex picks up from the same project context" width="100%"></p>
+<p align="center"><em>Claude Code hits its usage limit mid-task. Codex picks it up in the same conversation.</em></p>
 
-But each agent works inside its own session, with its own context and history. When you move between sessions or tools, you become responsible for carrying the project between them: restating goals, explaining previous decisions, locating artifacts, and checking what was left unfinished. You end up working as their intern, ferrying context between them to keep your own project moving.
+It isn't only usage limits. People already use several capable agents at work: for the newest model, the leftover quota, or because a particular tool is better at the job. But the plan you settled with Claude Code, the file Codex left half-edited, the trade-off you decided in Cursor: each one is locked inside its own session. Close the session or switch tools, and that context is out of reach.
 
-Orbital changes the unit of work from the session to the project.
+So you carry the project between them: restating goals, explaining previous decisions, locating artifacts, and checking what was left unfinished.
+
+**You are the agent's intern: copying and pasting, ferrying context, remembering where all the odd files live, while the agent gets the thinking.**
+
+Orbital takes the context out of the session and puts it back in your local folder, and changes the unit of work from the session to the project.
 
 A project agent stays responsible for the project across tasks, sessions, and worker agents. It maintains the shared context, decides what needs to happen next, delegates when useful, and records every outcome back into the project.
 
