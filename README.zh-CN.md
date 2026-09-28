@@ -16,19 +16,9 @@
 <p align="center"><strong>project agent（项目 agent）</strong></p>
 <h3 align="center">Agent只负责一次会话，Orbital负责整个项目。</h3>
 
-**你的上下文，是你的吗？**
+<p align="center">Orbital 把项目的上下文（状态、决策、经验教训、产出）以普通文件的形式维护在你的本地文件夹里。Claude Code、Codex、Cursor、Gemini CLI 轮流接手同一个项目，不用你再讲一遍。它自己也能直接干活。</p>
 
-Claude Code 里聊了三轮才定下的方案、Codex 改到一半的文件、Cursor 里拍板的取舍——各自锁在各自的会话里。
-
-会话一关、额度一到、换个工具，上下文就无法使用。下一个任务，你就得重新讲一遍。
-
-**你才是 agent 的实习生：复制粘贴、搬运上下文、记住杂七杂八的文件放在哪，让agent来做脑力活。**
-
-Orbital 把上下文从会话里拿出来，放回你的本地文件夹。任何 agent 随时接手，所有上下文全部保留。Claude Code、Codex、Cursor 都可以使用。
-
-**上下文资产是你的，智能是可替换的。**
-
-<p align="center"><strong>你的上下文资产，任何 agent 都能用</strong></p>
+<p align="center"><strong>上下文资产是你的，智能是可替换的。</strong></p>
 
 <p align="center">
   <a href="https://github.com/zqiren/Orbital/releases/latest/download/Orbital-Setup.exe"><img src="https://img.shields.io/badge/Windows-%E4%B8%8B%E8%BD%BD%E5%AE%89%E8%A3%85%E5%8C%85_.exe-0078D6?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTMgNC42bDcuNi0xLjA1djcuMzVIM3ptOC41LTEuMkwyMSAyLjF2OC44aC05LjV6TTMgMTIuMWg3LjZ2Ny4zNUwzIDE4LjR6bTguNSAwSDIxdjguOGwtOS41LTEuM3oiLz48L3N2Zz4=" alt="下载 Windows 安装包 (.exe)"></a>
@@ -43,17 +33,25 @@ https://github.com/user-attachments/assets/88cf118c-1dd9-4429-897d-f2003de3049d
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](#license) ![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows) ![Platform: macOS](https://img.shields.io/badge/Platform-macOS-000000?logo=apple)
 
+
 ---
 
 ## 为什么你需要一个“project” agent
 
+**你的上下文，是你的吗？**
+
 你正在和 Claude Code 讨论一个方案，聊到第三轮，它弹出「You're out of usage credits」。Codex 的额度还在，但 Codex 对这个项目一无所知——目标、前两轮拍板的结论、改到一半的文件，都得你重讲一遍。
 
-在工作中，大家都已经在同时用好几个 agent —— 可能是因为新出的模型、剩余的额度，也可能是因为某个工具更擅长这类活。
+<p align="center"><img src="docs/screenshots/in-session-agent-switch-zh.png" alt="Orbital 对话里的 agent 选择器：每个 agent 旁边显示额度还剩多少（Claude Code 5 小时窗口剩余 57%，Codex 本周剩余 84%），换一个 agent 就在同一个对话里接着做" width="100%"></p>
+<p align="center"><em>每个 agent 还剩多少额度，就写在选择器里。换一个，它从同一份项目上下文接着做。</em></p>
 
-但每个 agent 都活在自己的会话里，各有各的上下文和历史。当你在会话和工具之间来回切换时，把项目「搬运」过去的活就落到了你身上：重述目标、解释此前的决策、翻找产出的文件、确认还有什么没做完。你需要做它们的实习生，帮它们串联上下文，来保证你自己的项目正常运转。
+不只是额度。在工作中，大家都已经在同时用好几个 agent —— 可能是因为新出的模型、剩余的额度，也可能是因为某个工具更擅长这类活。但 Claude Code 里定下的方案、Codex 改到一半的文件、Cursor 里拍板的取舍——各自锁在各自的会话里。会话一关、换个工具，上下文就无法使用。
 
-Orbital 把工作的单位从「会话」换成「项目」。
+于是把项目「搬运」过去的活就落到了你身上：重述目标、解释此前的决策、翻找产出的文件、确认还有什么没做完。
+
+**你才是 agent 的实习生：复制粘贴、搬运上下文、记住杂七杂八的文件放在哪，让agent来做脑力活。**
+
+Orbital 把上下文从会话里拿出来，放回你的本地文件夹，把工作的单位从「会话」换成「项目」。
 
 project agent 跨任务、跨会话、跨执行 agent 持续对项目负责：维护共享的上下文，判断下一步该做什么，需要时把活派出去，并把每一次的结果记录回项目。
 
