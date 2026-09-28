@@ -385,6 +385,18 @@ If a universal binary is needed later, that is a spec change (`target_arch='univ
      under the stable names `Orbital-Setup.exe` / `Orbital-macOS.dmg`; the README's
      download buttons link to `releases/latest/download/<stable name>`, so a release
      without the aliases makes those buttons 404 until this runs.
+   - Then run `bash scripts/sync-release-to-oss.sh` to mirror the release to the
+     website's China download bucket. The website (`github.com/zqiren/orbital-website`,
+     edited in `~/Desktop/orbital-marketing/download-site/`) has two download paths:
+     `/en/` reads GitHub Releases live and needs nothing, but `/` (Chinese) serves
+     installers and the version/SHA256 it shows from Aliyun OSS, which only changes
+     when this script runs. Until then Chinese users keep downloading the previous
+     version. The script refuses a tag that isn't `latest`, checks each download
+     against GitHub's sha256, uploads the installers before `latest.json`, and then
+     re-reads the public bucket to confirm. Needs `ossutil` 2.x configured in
+     `~/.ossutilconfig` (a RAM key scoped to the bucket, on the release Mac only)
+     and roughly 800 MB each way. `--check` verifies without uploading, so use it
+     to answer "is the site current?".
    - Write release notes covering: user-visible changes, known issues (including the unsigned-installer warnings on both platforms), and install instructions
 
 3. **Update the README install links** if they reference a specific version rather than `/releases/latest`.
@@ -395,6 +407,7 @@ If a universal binary is needed later, that is a spec change (`target_arch='univ
 
 Within 24 hours of publishing:
 
+- `bash scripts/sync-release-to-oss.sh --check` must say `In sync.` (the Chinese website serves the new version)
 - Download both installers from the public Releases page (not local artifacts) on a fresh machine each
 - Run through the smoke test in each platform section
 - If a regression is found: do **not** delete or modify the release; cut a v{X.Y.Z+1} patch instead
