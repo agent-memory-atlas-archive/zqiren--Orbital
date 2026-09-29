@@ -83,8 +83,6 @@ The worker can change. The project continues.
 
    **Step 1 — LLM Provider:** In mainland China, tap **Sign in with TokenDance**, authorize, and start on free tokens. Otherwise pick a provider from the preset cards, follow the key-console link to grab an API key, and paste it in. Supports DeepSeek, Anthropic, OpenAI, Moonshot, and a dozen other providers.
 
-   <!-- TODO: re-capture — the current screenshot (Jul 27) predates the one-tap button (Sep 3) -->
-
    <p align="center"><img src="docs/screenshots/apikey-setup.png" alt="Setup wizard step 1: pick an LLM provider from preset cards and enter your API key" width="100%"></p>
 
 
@@ -95,7 +93,7 @@ The worker can change. The project continues.
 
 2. **Create a project** — give it a name, pick a workspace directory, set an autonomy level
 
-<p align="center"><img src="docs/screenshots/new-project-setting.png" alt="New project creation dialog with workspace directory and autonomy level settings" width="100%"></p>
+<p align="center"><img src="docs/screenshots/new-project-setting.png" alt="New project dialog: a project name and a folder, which can be new or an existing one the agent works inside" width="100%"></p>
 
 3. **Chat** — type a task in the chat bar and the project agent handles it
 4. **Walk away** — queue the next tasks; each finished one becomes context the next builds on
@@ -104,10 +102,10 @@ The worker can change. The project continues.
 
 ## See the project stay under one manager
 
-<p align="center"><img src="docs/screenshots/memory-context.png" alt="The orbital/ memory files — CONTEXT.md, DECISIONS.md, LESSONS.md, PROJECT_STATE.md, SESSION_LOG.md — maintained by the agent and read back every session" width="100%"></p>
+<p align="center"><img src="docs/screenshots/memory-context.png" alt="The orbital/ memory files (PROJECT_STATE.md, DECISIONS.md, LESSONS.md, INDEX.md, ASKS.md), maintained by the agent and read back every session" width="100%"></p>
 <p align="center"><em>The project agent keeps the project's state, decisions, and lessons current across sessions.</em></p>
 
-<p align="center"><img src="docs/screenshots/delegation-claudecode.png" alt="Your agent dispatches a task to the Claude Code sub-agent, which reads the project context, completes the work, and reports the deliverable back into the workspace" width="100%"></p>
+<p align="center"><img src="docs/screenshots/delegation-claudecode.png" alt="The project agent files a bug and dispatches Claude Code, which investigates for nine minutes against the same project context and reports the root cause and a spec back into the workspace" width="100%"></p>
 <p align="center"><em>It delegates to Claude Code, Codex, or Gemini CLI against the same project context, then records the result.</em></p>
 
 ---
@@ -222,8 +220,8 @@ Each dispatch renders a fresh inheritance prompt that points the worker at `PROJ
 <p align="center"><img src="docs/screenshots/subagent-memories.png" alt="Sub-Agent Memories panel — each sub-agent keeps its own long-term memory, curated per project, that it reads on every dispatch" width="100%"></p>
 <p align="center"><em>Each sub-agent keeps its own long-term memory across dispatches — curate what it remembers...</em></p>
 
-<p align="center"><img src="docs/screenshots/delegation-claudecode.png" alt="The management agent dispatches a GitHub scan to the Claude Code sub-agent, which runs 21 tool calls and reports the deliverable back into the workspace" width="100%"></p>
-<p align="center"><em>...then delegates a task to @claudecode, reviews the result, and writes it back into the project</em></p>
+<p align="center"><img src="docs/screenshots/delegation-claudecode.png" alt="The project agent dispatches a bug investigation to the Claude Code sub-agent, which runs 50 tool calls and reports the root cause and spec back into the workspace" width="100%"></p>
+<p align="center"><em>...then delegates a task to Claude Code, reviews the result, and writes it back into the project</em></p>
 
 **Transport types:**
 
@@ -281,7 +279,7 @@ Automations you set up months ago shouldn't fire invisibly. Every enabled schedu
 
 The project agent can read this calendar too, so "what's already on the schedule" is context it plans around instead of something you have to restate.
 
-<p align="center"><img src="docs/screenshots/calendar.png" alt="Calendar week view showing a project's recurring automations — a daily repo scan across the week plus a Monday growth ritual" width="100%"></p>
+<p align="center"><img src="docs/screenshots/calendar.png" alt="Calendar week view showing a project's recurring automations: a daily issues check, a Monday backlog triage, and a Tuesday release-notes draft" width="100%"></p>
 <p align="center"><em>The week ahead, as your automations will actually run it</em></p>
 
 </details>
@@ -334,8 +332,8 @@ Built on **Patchright** (a Playwright fork with anti-bot-detection):
 - **Accessibility-first**: `snapshot` returns an accessibility tree with `[ref=eN]` element references for reliable interaction
 - **26 browser actions**: navigate, click, type, fill, press, hover, select, drag, upload, snapshot, screenshot, extract, search (page), evaluate, tab management, go back/forward, reload, wait, PDF export, web search, URL fetch, batch
 
-<p align="center"><img src="docs/screenshots/5A-mobile-browsing-activity.png" alt="Mobile view of the agent browsing arxiv.org, scanning research papers on a daily schedule" width="300"></p>
-<p align="center"><em>Your agent browsing arxiv.org — scanning for AI reasoning papers on a daily schedule</em></p>
+<p align="center"><img src="docs/screenshots/5A-mobile-browsing-activity.png" alt="Mobile view of the agent browsing Hacker News, each browser step and its reasoning visible in the chat" width="300"></p>
+<p align="center"><em>Your agent browsing Hacker News, with every step visible from your phone</em></p>
 
 </details>
 
@@ -356,20 +354,20 @@ The project agent translates this into a `create_trigger` tool call with the app
 | **Schedule** | Cron expression + timezone | `0 6 * * *` (daily at 6 AM) |
 | **File Watch** | Path + glob patterns + debounce | `uploads/*.jpg`, 5s debounce |
 
-<p align="center"><img src="docs/screenshots/file-watch-trigger.png" alt="File watch trigger detail: watching uploads/ for new images and triaging each one on arrival, with its watched path, patterns, last fired time, and run count" width="100%"></p>
-<p align="center"><em>File watch trigger: watches uploads/ for new photos and analyzes each one on arrival</em></p>
+<p align="center"><img src="docs/screenshots/file-watch-trigger.png" alt="File watch trigger editor: watching evidence/inbox/ for new bug screenshots, with its folder, file patterns, debounce, who runs it, and the prompt" width="100%"></p>
+<p align="center"><em>File watch trigger: watches evidence/inbox/ for new bug screenshots and triages each one on arrival</em></p>
 
-<p align="center"><img src="docs/screenshots/scheduled-trigger.png" alt="Schedule trigger detail: a weekly growth-experiment ritual every Monday at 9 AM, with its full task, cadence, last fired time, and run count" width="100%"></p>
-<p align="center"><em>Schedule trigger: a daily competitor watch dispatched every day at 2 PM — 19 runs so far</em></p>
+<p align="center"><img src="docs/screenshots/scheduled-trigger.png" alt="Schedule trigger editor: a weekly backlog triage every Monday at 10 AM, with its cadence, time zone, who runs it, and the prompt" width="100%"></p>
+<p align="center"><em>Schedule trigger: a weekly backlog triage every Monday at 10 AM</em></p>
 
-**Real-world example — Health Tracker with file watch:**
+**Real-world example: a bug-report inbox with file watch**
 
 <p align="center">
-  <img src="docs/screenshots/4B-mobile-meal-chat1.jpg" alt="Mobile chat: setting up a meal photo file watcher from the phone" width="280">
+  <img src="docs/screenshots/4B-mobile-watch-1.png" alt="Mobile chat: asking the agent to watch evidence/bug-reports/, and the agent creating the file-watch trigger" width="280">
   &nbsp;
-  <img src="docs/screenshots/4B-mobile-meal-chat2.jpg" alt="Mobile chat: the agent automatically analyzing a dropped meal photo" width="280">
+  <img src="docs/screenshots/4B-mobile-watch-2.png" alt="Mobile chat: the triggered run reading a dropped bug report, filing it in the backlog, and having Claude Code write the spec" width="280">
 </p>
-<p align="center"><em>Left: "Watch uploads/ for meal photos and track calories." Right: Drop a photo, get instant nutritional analysis.</em></p>
+<p align="center"><em>Left: "Watch evidence/bug-reports/ for new bug reports." Right: drop a report in, and the agent files it and gets a spec written.</em></p>
 
 </details>
 
