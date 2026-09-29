@@ -25,7 +25,7 @@
   &nbsp;&nbsp;
   <a href="https://github.com/zqiren/Orbital/releases/latest/download/Orbital-macOS.dmg"><img src="https://img.shields.io/badge/macOS-%E4%B8%8B%E8%BD%BD%E5%AE%89%E8%A3%85%E5%8C%85_.dmg-000000?style=for-the-badge&logo=apple&logoColor=white" alt="下载 macOS 安装包 (.dmg)"></a>
 </p>
-<p align="center">5 分钟就能装好。需要自备 API key。</p>
+<p align="center">5 分钟就能装好。需要自备 API key。第一次用？看 <a href="https://orbital.top/guide/">Orbital 使用教程</a>。</p>
 
 <p align="center"><em>1 分钟演示：执行 agent 换了三次，项目没停</em></p>
 
@@ -77,6 +77,8 @@ Agent可以换。你的上下文资产一直在。
 ---
 
 ## 快速开始
+
+> 每一步都带截图的完整教程见 **[Orbital 使用教程](https://orbital.top/guide/)**：配置 API key、新建项目、切换子 Agent、任务队列、自动任务和项目设置。
 
 1. **启动 Orbital** —— 设置向导引导你完成两步：
 

@@ -24,7 +24,7 @@
   &nbsp;&nbsp;
   <a href="https://github.com/zqiren/Orbital/releases/latest/download/Orbital-macOS.dmg"><img src="https://img.shields.io/badge/macOS-Download_.dmg-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download the macOS installer (.dmg)"></a>
 </p>
-<p align="center">Set up in under 5 minutes. No Python or Node required. Bring your own API key.</p>
+<p align="center">Set up in under 5 minutes. No Python or Node required. Bring your own API key. New here? Read the <a href="https://orbital.top/en/guide/">user guide</a>.</p>
 
 <p align="center"><em>One-minute demo: one task, two agents, nothing re-explained</em></p>
 
@@ -78,6 +78,8 @@ The worker can change. The project continues.
 ---
 
 ## Quick Start
+
+> Want the step-by-step version with screenshots? See the **[Orbital user guide](https://orbital.top/en/guide/)**: API keys, projects, switching agents, the task queue, automations and project settings.
 
 1. **Launch Orbital** — the setup wizard guides you through two steps:
 
