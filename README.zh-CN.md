@@ -25,7 +25,7 @@
   &nbsp;&nbsp;
   <a href="https://github.com/zqiren/Orbital/releases/latest/download/Orbital-macOS.dmg"><img src="https://img.shields.io/badge/macOS-%E4%B8%8B%E8%BD%BD%E5%AE%89%E8%A3%85%E5%8C%85_.dmg-000000?style=for-the-badge&logo=apple&logoColor=white" alt="下载 macOS 安装包 (.dmg)"></a>
 </p>
-<p align="center">5 分钟就能装好。需要自备 API key。</p>
+<p align="center">5 分钟就能装好。需要自备 API key。第一次用？看 <a href="https://orbital.top/guide/">Orbital 使用教程</a>。</p>
 
 <p align="center"><em>1 分钟演示：执行 agent 换了三次，项目没停</em></p>
 
@@ -78,11 +78,11 @@ Agent可以换。你的上下文资产一直在。
 
 ## 快速开始
 
+> 每一步都带截图的完整教程见 **[Orbital 使用教程](https://orbital.top/guide/)**：配置 API key、新建项目、切换子 Agent、任务队列、自动任务和项目设置。
+
 1. **启动 Orbital** —— 设置向导引导你完成两步：
 
    **Step 1 — LLM Provider:** 中国大陆用户点「一键登录词元跳动」，授权后免费领取 Token，直接开始。也可以从预设卡片里选择服务商，点「获取 API 密钥」直达密钥控制台，粘贴即可——支持 DeepSeek、Moonshot (Kimi)、智谱、MiniMax、Anthropic、OpenAI 等十余家服务商。
-
-   <!-- TODO: 重新截图——当前截图（7 月 27 日）早于一键登录按钮（9 月 3 日），画面里还没有这个按钮 -->
 
    <p align="center">
      <img src="docs/screenshots/zh/apikey-setup.png" alt="设置向导第一步——从预设卡片选择 LLM provider 并配置 API key" width="700">
@@ -97,7 +97,7 @@ Agent可以换。你的上下文资产一直在。
 2. **创建项目** —— 起个名字，选择本地的一个文件夹，设定 autonomy 等级
 
    <p align="center">
-     <img src="docs/screenshots/zh/new-project-setting.png" alt="新建项目页面——选择工作空间目录和 autonomy 等级" width="700">
+     <img src="docs/screenshots/zh/new-project-setting.png" alt="新建项目对话框：填写项目名称，选择一个新文件夹或已有文件夹，agent 就在里面工作" width="700">
    </p>
 3. **开始对话** —— 在聊天框输入任务，管理 agent 自己处理
 4. **走开** —— 把后续任务排进队列；每个完成项都会成为下一项的上下文
@@ -106,10 +106,10 @@ Agent可以换。你的上下文资产一直在。
 
 ## 项目始终由同一个管理 agent 负责
 
-<p align="center"><img src="docs/screenshots/zh/memory-context.png" alt="orbital/ 记忆文件——CONTEXT.md、DECISIONS.md、LESSONS.md、PROJECT_STATE.md 由 agent 维护，每个会话读回" width="800"></p>
+<p align="center"><img src="docs/screenshots/zh/memory-context.png" alt="orbital/ 记忆文件：PROJECT_STATE.md、DECISIONS.md、LESSONS.md、INDEX.md、ASKS.md 由 agent 维护，每个会话读回" width="800"></p>
 <p align="center"><em>管理 agent 跨会话维护项目的状态、决策与经验</em></p>
 
-<p align="center"><img src="docs/screenshots/delegation-claudecode.png" alt="把任务派给 Claude Code sub-agent，它读取项目上下文、完成工作并把成果写回工作空间" width="800"></p>
+<p align="center"><img src="docs/screenshots/zh/delegation-claudecode.png" alt="项目 agent 记录一个 bug 并派给 Claude Code，Claude Code 基于同一份项目上下文调查 12 分钟，把根因和 spec 写回工作空间" width="800"></p>
 <p align="center"><em>管理 agent 基于同一份项目上下文把任务派给 Claude Code、Codex 或 Gemini，再记录执行结果</em></p>
 
 <p align="center"><img src="docs/screenshots/zh/files.png" alt="工作空间文件树——agent 不断积累的产出与 orbital/ 记忆文件" width="800"></p>
@@ -121,13 +121,13 @@ Agent可以换。你的上下文资产一直在。
 <p align="center"><img src="docs/screenshots/zh/workbench.png" alt="工作台——跨所有项目汇总的待你决策事项，每条都标注来源项目、已等待时长，以及「已完成 / 删除」出口" width="800"></p>
 <p align="center"><em>工作台（beta）——只有你能拍板的事（花钱决策、必须用你账号发出的消息）由 agent 标记后跨项目汇总到一处，展开还能看到它这么判断的依据</em></p>
 
-<p align="center"><img src="docs/screenshots/zh/calendar.png" alt="日历周视图——项目的循环自动任务：每天的仓库巡检，加上每周一的增长复盘" width="800"></p>
+<p align="center"><img src="docs/screenshots/zh/calendar.png" alt="日历周视图：项目的循环自动任务，每天的 issue 巡检、每周一的 backlog 梳理、每周二的发布说明草稿" width="800"></p>
 <p align="center"><em>日历（beta）——把已启用的定时 trigger 和带截止日期的承诺投影到周视图上，自动任务不再悄无声息地跑；管理 agent 自己也能读取它来安排工作</em></p>
 
 <p align="center"><img src="docs/screenshots/zh/skills.png" alt="Skills 设置——agent 遵循的可复用操作模式" width="800"></p>
 <p align="center"><em>Skills——agent 从多步流程中沉淀出可复用的操作模式，下次遇到类似任务先查阅</em></p>
 
-<p align="center"><img src="docs/screenshots/zh/scheduled-trigger.png" alt="定时 trigger 详情——每周一上午 9 点的增长实验复盘任务，含完整任务描述、执行周期、上次触发与运行次数" width="800"></p>
+<p align="center"><img src="docs/screenshots/zh/scheduled-trigger.png" alt="定时 trigger 编辑：每周一上午 10 点梳理 backlog，含执行周期、时区、运行者和提示词" width="800"></p>
 <p align="center"><em>定时与文件监听 trigger——让管理 agent 定期检查并自动派发 sub-agent，无需你动手</em></p>
 
 <p align="center"><img src="docs/screenshots/zh/settings-budget.png" alt="预算设置——花费上限、重置周期、按模型的实时成本明细、可编辑的价格表" width="800"></p>
@@ -137,9 +137,9 @@ Agent可以换。你的上下文资产一直在。
 <p align="center"><em>网站凭据存放在系统钥匙串里，绝不暴露给聊天</em></p>
 
 <p align="center">
-  <img src="docs/screenshots/5A-mobile-browsing-activity.png" alt="手机端——agent 在浏览 arxiv，按日程扫描论文" width="280">
+  <img src="docs/screenshots/zh/5A-mobile-browsing-activity.png" alt="手机端：agent 在浏览 Hacker News，每一步浏览和推理都显示在对话里" width="280">
   &nbsp;&nbsp;
-  <img src="docs/screenshots/5B2-mobile-approval-card.png" alt="移动端审批卡片——在手机上批准 agent 动作" width="280">
+  <img src="docs/screenshots/zh/5B2-mobile-approval-card.png" alt="移动端审批卡片——在手机上批准 agent 动作" width="280">
 </p>
 <p align="center"><em>手机上监督：实时查看 agent 活动，带完整上下文批准关键动作（可附加指引）</em></p>
 
