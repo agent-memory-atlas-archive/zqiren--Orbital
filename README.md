@@ -2,10 +2,10 @@
   <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-<p align="center"><strong>Claude Code running out? Switch to Codex in the same conversation. Nothing re-explained.</strong></p>
+<p align="center"><strong>Codex hits its usage limit mid-task. Switch to Claude Code in the same conversation. Nothing re-explained.</strong></p>
 
-<p align="center"><img src="docs/screenshots/in-session-agent-switch.png" alt="The agent picker in an Orbital chat: each agent shows how much of its usage window is left (Claude Code 67% of its week, Codex 84%), and switching to another agent continues the same conversation" width="100%"></p>
-<p align="center"><em>Every agent's remaining quota sits in the picker. Pick another one and it continues from the same project context.</em></p>
+<p align="center"><img src="docs/screenshots/hero-agent-switch.gif" alt="In one Orbital conversation Codex stops with a usage-limit error; the user opens the agent picker, which shows Codex's limit reached and Claude Code with 91% left, switches to Claude Code, and it reads the project's context files and answers the original question" width="100%"></p>
+<p align="center"><em>Codex stops at its usage limit. One switch in the picker, and Claude Code answers the same question from the project's own context files.</em></p>
 
 <p align="center">
   <img src="docs/screenshots/orbital-logo.png" alt="Orbital" width="80">
@@ -41,9 +41,8 @@ https://github.com/user-attachments/assets/5f1373bc-2c3e-440b-af52-77ecbd80c27f
 
 You're three rounds into a design discussion with Claude Code when it stops with "You're out of usage credits." Your Codex quota is sitting right there, but Codex knows nothing about this project: the goal, the two decisions you just made, the half-edited files. You'd have to explain all of it again.
 
-<!-- The clip is the Chinese-UI capture; an English re-shoot of the same scenario is pending -->
-<p align="center"><img src="docs/screenshots/handoff-codex-continue.gif" alt="In the same conversation Claude Code hits its usage limit; the user tells @codex to continue and Codex picks up from the same project context" width="100%"></p>
-<p align="center"><em>Claude Code hits its usage limit mid-task. Codex picks it up in the same conversation.</em></p>
+<p align="center"><img src="docs/screenshots/in-session-agent-switch.png" alt="The agent picker in an Orbital chat: each agent shows how much of its usage window is left (Claude Code 67% of its week, Codex 84%), and switching to another agent continues the same conversation" width="100%"></p>
+<p align="center"><em>Every agent's remaining quota sits in the picker. Pick another one and it continues from the same project context.</em></p>
 
 It isn't only usage limits. People already use several capable agents at work: for the newest model, the leftover quota, or because a particular tool is better at the job. But the plan you settled with Claude Code, the file Codex left half-edited, the trade-off you decided in Cursor: each one is locked inside its own session. Close the session or switch tools, and that context is out of reach.
 
